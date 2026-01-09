@@ -1,19 +1,21 @@
 import sys
-import numpy as np
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                               QHBoxLayout, QPushButton, QTextEdit, QDialog,
-                               QLabel, QLineEdit, QGridLayout, QMessageBox)
-from PySide6.QtCore import Qt, Signal
-import pyqtgraph as pg
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
 import warnings
 
-warnings.filterwarnings('ignore')
+import numpy as np
+import pyqtgraph as pg
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QHBoxLayout, QPushButton, QTextEdit, QDialog,
+                               QLabel, QLineEdit, QGridLayout, QMessageBox,
+                               QDoubleSpinBox, QCheckBox, QGroupBox)
+from dataclasses import dataclass
+from typing import Optional
 
 from preprocessing import preprocess_stroke, is_function, detect_discontinuities
 from fitting import fit_models, select_best_model
 from latex_gen import model_to_latex
+
+warnings.filterwarnings('ignore')
 
 
 @dataclass
@@ -23,6 +25,7 @@ class PlotSettings:
     y_min: float = -10.0
     y_max: float = 10.0
     grid_spacing: float = 1.0
+    accuracy: float = 0.01
 
 
 class SettingsDialog(QDialog):
@@ -68,23 +71,45 @@ class SettingsDialog(QDialog):
                 x_max=float(self.x_max_edit.text()),
                 y_min=float(self.y_min_edit.text()),
                 y_max=float(self.y_max_edit.text()),
-                grid_spacing=float(self.grid_edit.text())
+                grid_spacing=float(self.grid_edit.text()),
+                accuracy=self.settings.accuracy
             )
         except ValueError:
             return None
 
 
 class DrawingApp(QMainWindow):
+    COLORS = [
+        (255, 0, 0),
+        (0, 200, 0),
+        (255, 150, 0),
+        (200, 0, 200),
+        (0, 200, 200),
+    ]
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Function Drawer & LaTeX Generator")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1400, 800)
 
         self.settings = PlotSettings()
         self.drawing = False
         self.points = []
-        self.fitted_curve = None
+        self.fitted_curves = []
         self.drawn_curve = None
+        self.all_models = []
+        self.x_proc = None
+        self.y_proc = None
+        self.option_checkboxes = []
+
+        self.plot_widget = None
+        self.accuracy_spinbox = None
+        self.clear_button = None
+        self.fit_button = None
+        self.export_button = None
+        self.settings_button = None
+        self.options_layout = None
+        self.latex_output = None
 
         self.setup_ui()
         self.setup_plot()
@@ -97,7 +122,24 @@ class DrawingApp(QMainWindow):
         left_layout = QVBoxLayout()
 
         self.plot_widget = pg.PlotWidget()
+        self.plot_widget.addLegend(offset=(10, 10))
         left_layout.addWidget(self.plot_widget)
+
+        accuracy_layout = QHBoxLayout()
+        accuracy_layout.addWidget(QLabel("Approximation Accuracy:"))
+
+        self.accuracy_spinbox = QDoubleSpinBox()
+        self.accuracy_spinbox.setRange(0.0001, 1.0)
+        self.accuracy_spinbox.setSingleStep(0.001)
+        self.accuracy_spinbox.setDecimals(4)
+        self.accuracy_spinbox.setValue(self.settings.accuracy)
+        self.accuracy_spinbox.valueChanged.connect(self.on_accuracy_changed)
+        accuracy_layout.addWidget(self.accuracy_spinbox)
+
+        accuracy_layout.addWidget(QLabel("(lower = higher quality)"))
+        accuracy_layout.addStretch()
+
+        left_layout.addLayout(accuracy_layout)
 
         button_layout = QHBoxLayout()
         self.clear_button = QPushButton("Clear")
@@ -119,15 +161,22 @@ class DrawingApp(QMainWindow):
         main_layout.addLayout(left_layout, 3)
 
         right_layout = QVBoxLayout()
-        right_layout.addWidget(QLabel("LaTeX Output:"))
+
+        options_group = QGroupBox("Display Options")
+        self.options_layout = QVBoxLayout()
+        options_group.setLayout(self.options_layout)
+        right_layout.addWidget(options_group)
+
+        right_layout.addWidget(QLabel("LaTeX Output (Top Candidates):"))
         self.latex_output = QTextEdit()
         self.latex_output.setReadOnly(True)
         right_layout.addWidget(self.latex_output)
 
         main_layout.addLayout(right_layout, 1)
 
-        self.plot_widget.scene().sigMouseClicked.connect(self.mouse_clicked)
-        self.plot_widget.scene().sigMouseMoved.connect(self.mouse_moved)
+        scene = self.plot_widget.scene()
+        scene.sigMouseClicked.connect(self.mouse_clicked)
+        scene.sigMouseMoved.connect(self.mouse_moved)
 
     def setup_plot(self):
         self.plot_widget.setLabel('left', 'y')
@@ -136,16 +185,13 @@ class DrawingApp(QMainWindow):
         self.plot_widget.setXRange(self.settings.x_min, self.settings.x_max)
         self.plot_widget.setYRange(self.settings.y_min, self.settings.y_max)
 
-        x_ticks = np.arange(self.settings.x_min, self.settings.x_max + self.settings.grid_spacing,
-                            self.settings.grid_spacing)
-        y_ticks = np.arange(self.settings.y_min, self.settings.y_max + self.settings.grid_spacing,
-                            self.settings.grid_spacing)
-
-        ax = self.plot_widget.getAxis('bottom')
-        ay = self.plot_widget.getAxis('left')
+    def on_accuracy_changed(self, value):
+        self.settings.accuracy = max(0.0001, value)
+        if value != self.settings.accuracy:
+            self.accuracy_spinbox.setValue(self.settings.accuracy)
 
     def mouse_clicked(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             pos = event.scenePos()
             if self.plot_widget.sceneBoundingRect().contains(pos):
                 mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(pos)
@@ -168,8 +214,23 @@ class DrawingApp(QMainWindow):
 
         if len(self.points) > 1:
             points_array = np.array(self.points)
-            self.drawn_curve = self.plot_widget.plot(points_array[:, 0], points_array[:, 1],
-                                                     pen=pg.mkPen('b', width=2))
+            self.drawn_curve = self.plot_widget.plot(
+                points_array[:, 0],
+                points_array[:, 1],
+                pen=pg.mkPen((100, 100, 255), width=2),
+                name="Drawn curve"
+            )
+
+    def clear_fitted_curves(self):
+        for curve in self.fitted_curves:
+            self.plot_widget.removeItem(curve)
+        self.fitted_curves = []
+
+    def clear_option_checkboxes(self):
+        for checkbox in self.option_checkboxes:
+            checkbox.setParent(None)
+            checkbox.deleteLater()
+        self.option_checkboxes = []
 
     def clear_drawing(self):
         self.points = []
@@ -177,10 +238,21 @@ class DrawingApp(QMainWindow):
         if self.drawn_curve is not None:
             self.plot_widget.removeItem(self.drawn_curve)
             self.drawn_curve = None
-        if self.fitted_curve is not None:
-            self.plot_widget.removeItem(self.fitted_curve)
-            self.fitted_curve = None
+
+        self.clear_fitted_curves()
+        self.clear_option_checkboxes()
+
+        self.all_models = []
+        self.x_proc = None
+        self.y_proc = None
         self.latex_output.clear()
+
+        self.plot_widget.clear()
+        self.plot_widget.addLegend(offset=(10, 10))
+
+    def toggle_option(self, index, checked):
+        if index < len(self.fitted_curves):
+            self.fitted_curves[index].setVisible(checked)
 
     def fit_curve(self):
         if len(self.points) < 10:
@@ -206,9 +278,12 @@ class DrawingApp(QMainWindow):
             QMessageBox.warning(self, "Not a Function", error_msg)
             return
 
+        self.x_proc = x_proc
+        self.y_proc = y_proc
+
         segments = detect_discontinuities(x_proc, y_proc)
 
-        models = fit_models(x_proc, y_proc, segments)
+        models = fit_models(x_proc, y_proc, segments, self.settings.accuracy)
 
         if not models:
             QMessageBox.warning(self, "Fitting Failed", "Could not fit any model to the data")
@@ -216,17 +291,51 @@ class DrawingApp(QMainWindow):
 
         best_model = select_best_model(models, x_proc, y_proc)
 
-        latex_str = model_to_latex(best_model)
-        self.latex_output.setPlainText(latex_str)
+        y_std = np.std(y_proc)
+        scores = []
+        for model in models:
+            normalized_rmse = model.rmse / y_std if y_std > 0 else model.rmse
+            score = normalized_rmse + 0.1 * model.aic + model.complexity
+            scores.append(score)
 
+        sorted_indices = np.argsort(scores)
+        top_models = [models[i] for i in sorted_indices[:min(5, len(models))]]
+
+        self.all_models = top_models
+
+        self.clear_fitted_curves()
+        self.clear_option_checkboxes()
+
+        latex_parts = []
         x_plot = np.linspace(np.min(x_proc), np.max(x_proc), 500)
-        y_plot = best_model.evaluate(x_plot)
 
-        if self.fitted_curve is not None:
-            self.plot_widget.removeItem(self.fitted_curve)
+        for idx, model in enumerate(top_models):
+            latex_str = model_to_latex(model)
+            marker = "★ BEST FIT" if model == best_model else ""
+            latex_parts.append(f"Option {idx + 1} - {model.name} {marker}\nRMSE: {model.rmse:.6f}\n{latex_str}\n")
 
-        self.fitted_curve = self.plot_widget.plot(x_plot, y_plot,
-                                                  pen=pg.mkPen('r', width=2, style=Qt.DashLine))
+            y_plot = model.evaluate(x_plot)
+
+            color = self.COLORS[idx % len(self.COLORS)]
+            pen_style = Qt.PenStyle.SolidLine if model == best_model else Qt.PenStyle.DashLine
+            pen_width = 3 if model == best_model else 2
+
+            curve = self.plot_widget.plot(
+                x_plot,
+                y_plot,
+                pen=pg.mkPen(color, width=pen_width, style=pen_style),
+                name=f"Option {idx + 1}: {model.name}"
+            )
+            self.fitted_curves.append(curve)
+
+            checkbox = QCheckBox(f"Option {idx + 1}: {model.name} {marker}")
+            checkbox.setChecked(True)
+            checkbox.setStyleSheet(f"color: rgb{color}; font-weight: bold;")
+            checkbox.stateChanged.connect(lambda state, i=idx: self.toggle_option(i, state == Qt.CheckState.Checked))
+            self.options_layout.addWidget(checkbox)
+            self.option_checkboxes.append(checkbox)
+
+        self.latex_output.setPlainText("\n".join(latex_parts))
 
     def copy_latex(self):
         latex_text = self.latex_output.toPlainText()
@@ -240,6 +349,7 @@ class DrawingApp(QMainWindow):
             new_settings = dialog.get_settings()
             if new_settings:
                 self.settings = new_settings
+                self.accuracy_spinbox.setValue(self.settings.accuracy)
                 self.setup_plot()
                 self.clear_drawing()
 
@@ -273,14 +383,21 @@ def run_synthetic_test():
         segments = detect_discontinuities(x_proc, y_proc)
         print(f"  Segments: {len(segments)}")
 
-        models = fit_models(x_proc, y_proc, segments)
+        models = fit_models(x_proc, y_proc, segments, accuracy=0.01)
 
         if models:
             best_model = select_best_model(models, x_proc, y_proc)
             latex = model_to_latex(best_model)
             print(f"  Best model: {best_model.name}")
             print(f"  LaTeX: {latex}")
-            print(f"  RMSE: {best_model.rmse:.4f}\n")
+            print(f"  RMSE: {best_model.rmse:.6f}")
+
+            print(f"  All candidates ({len(models)}):")
+            for idx, model in enumerate(models, 1):
+                latex_candidate = model_to_latex(model)
+                print(f"    {idx}. {model.name} - RMSE: {model.rmse:.6f}")
+                print(f"       {latex_candidate}")
+            print()
         else:
             print("  No models found\n")
 

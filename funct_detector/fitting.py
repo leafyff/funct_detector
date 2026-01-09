@@ -27,16 +27,20 @@ def compute_aic(n: int, mse: float, k: int) -> float:
     return n * np.log(mse) + 2 * k
 
 
-def fit_polynomial(x: np.ndarray, y: np.ndarray, max_degree: int = 15) -> Optional[FittedModel]:
+def fit_polynomial(x: np.ndarray, y: np.ndarray, accuracy: float,
+                   max_degree: int = 15) -> Optional[FittedModel]:
     best_degree = None
     best_aic = np.inf
     best_coeffs = None
+
+    target_rmse = max(0.0001, accuracy)
 
     for degree in range(1, min(max_degree + 1, len(x) - 1)):
         try:
             coeffs = np.polyfit(x, y, degree)
             y_pred = np.polyval(coeffs, x)
-            mse = np.mean((y - y_pred) ** 2)
+            rmse = compute_rmse(y, y_pred)
+            mse = rmse ** 2
             aic = compute_aic(len(x), mse, degree + 1)
 
             penalty = 0.5 if degree > 8 else 0
@@ -46,7 +50,11 @@ def fit_polynomial(x: np.ndarray, y: np.ndarray, max_degree: int = 15) -> Option
                 best_aic = aic_penalized
                 best_degree = degree
                 best_coeffs = coeffs
-        except:
+
+            if rmse < target_rmse and degree > 1:
+                break
+
+        except (np.linalg.LinAlgError, ValueError):
             continue
 
     if best_coeffs is None:
@@ -55,8 +63,8 @@ def fit_polynomial(x: np.ndarray, y: np.ndarray, max_degree: int = 15) -> Option
     y_pred = np.polyval(best_coeffs, x)
     rmse = compute_rmse(y, y_pred)
 
-    def evaluate(x_new):
-        return np.polyval(best_coeffs, x_new)
+    def evaluate(x_eval):
+        return np.polyval(best_coeffs, x_eval)
 
     return FittedModel(
         name=f"Polynomial (degree {best_degree})",
@@ -69,7 +77,7 @@ def fit_polynomial(x: np.ndarray, y: np.ndarray, max_degree: int = 15) -> Option
     )
 
 
-def fit_sinusoidal(x: np.ndarray, y: np.ndarray) -> Optional[FittedModel]:
+def fit_sinusoidal(x: np.ndarray, y: np.ndarray, accuracy: float) -> Optional[FittedModel]:
     try:
         y_fft = np.fft.fft(y - np.mean(y))
         freqs = np.fft.fftfreq(len(x), np.mean(np.diff(x)))
@@ -88,29 +96,31 @@ def fit_sinusoidal(x: np.ndarray, y: np.ndarray) -> Optional[FittedModel]:
         if power_ratio < 0.4 or f0 == 0:
             return None
 
-        A_init = 2 * positive_fft[dominant_idx] / len(x)
-        B_init = np.mean(y)
+        a_init = 2 * positive_fft[dominant_idx] / len(x)
+        b_init = np.mean(y)
         phase_init = 0
 
-        def sin_func(x, A, f, phase, B):
-            return A * np.sin(2 * np.pi * f * x + phase) + B
+        def sin_func(x_vals, amplitude, freq, phase, offset):
+            return amplitude * np.sin(2 * np.pi * freq * x_vals + phase) + offset
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            popt, _ = curve_fit(sin_func, x, y,
-                                p0=[A_init, f0, phase_init, B_init],
-                                maxfev=5000)
+            result = curve_fit(sin_func, x, y,
+                               p0=[a_init, f0, phase_init, b_init],
+                               maxfev=5000)
+            popt: np.ndarray = np.asarray(result[0])
 
-        y_pred = sin_func(x, *popt)
+        y_pred = sin_func(x, popt[0], popt[1], popt[2], popt[3])
         rmse = compute_rmse(y, y_pred)
 
-        if rmse / np.std(y) > 0.3:
+        target_rmse = max(0.0001, accuracy)
+        if rmse / np.std(y) > 0.5 or rmse > target_rmse * 10:
             return None
 
         aic = compute_aic(len(x), rmse ** 2, 4)
 
-        def evaluate(x_new):
-            return sin_func(x_new, *popt)
+        def evaluate(x_eval):
+            return sin_func(x_eval, popt[0], popt[1], popt[2], popt[3])
 
         return FittedModel(
             name="Sinusoidal",
@@ -119,9 +129,10 @@ def fit_sinusoidal(x: np.ndarray, y: np.ndarray) -> Optional[FittedModel]:
             rmse=rmse,
             aic=aic,
             complexity=3.0,
-            params={"A": popt[0], "f": popt[1], "phase": popt[2], "B": popt[3]}
+            params={"A": float(popt[0]), "f": float(popt[1]),
+                    "phase": float(popt[2]), "B": float(popt[3])}
         )
-    except:
+    except (RuntimeError, ValueError, TypeError):
         return None
 
 
@@ -140,25 +151,26 @@ def fit_exponential(x: np.ndarray, y: np.ndarray) -> Optional[FittedModel]:
         if r_squared < 0.85:
             return None
 
-        def exp_func(x, A, B, C):
-            return A * np.exp(B * x) + C
+        def exp_func(x_vals, amplitude, rate, offset):
+            return amplitude * np.exp(rate * x_vals) + offset
 
-        A_init = np.exp(coeffs[1]) if np.all(y > 0) else -np.exp(coeffs[1])
-        B_init = coeffs[0]
-        C_init = 0
+        a_init = np.exp(coeffs[1]) if np.all(y > 0) else -np.exp(coeffs[1])
+        b_init = coeffs[0]
+        c_init = 0
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            popt, _ = curve_fit(exp_func, x, y,
-                                p0=[A_init, B_init, C_init],
-                                maxfev=5000)
+            result = curve_fit(exp_func, x, y,
+                               p0=[a_init, b_init, c_init],
+                               maxfev=5000)
+            popt: np.ndarray = np.asarray(result[0])
 
-        y_pred = exp_func(x, *popt)
+        y_pred = exp_func(x, popt[0], popt[1], popt[2])
         rmse = compute_rmse(y, y_pred)
         aic = compute_aic(len(x), rmse ** 2, 3)
 
-        def evaluate(x_new):
-            return exp_func(x_new, *popt)
+        def evaluate(x_eval):
+            return exp_func(x_eval, popt[0], popt[1], popt[2])
 
         return FittedModel(
             name="Exponential",
@@ -167,9 +179,9 @@ def fit_exponential(x: np.ndarray, y: np.ndarray) -> Optional[FittedModel]:
             rmse=rmse,
             aic=aic,
             complexity=3.0,
-            params={"A": popt[0], "B": popt[1], "C": popt[2]}
+            params={"A": float(popt[0]), "B": float(popt[1]), "C": float(popt[2])}
         )
-    except:
+    except (RuntimeError, ValueError, TypeError):
         return None
 
 
@@ -185,19 +197,20 @@ def fit_logarithmic(x: np.ndarray, y: np.ndarray) -> Optional[FittedModel]:
         if r_squared < 0.85:
             return None
 
-        def log_func(x, A, B):
-            return A * np.log(x) + B
+        def log_func(x_vals, amplitude, offset):
+            return amplitude * np.log(x_vals) + offset
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            popt, _ = curve_fit(log_func, x, y, p0=[coeffs[0], coeffs[1]])
+            result = curve_fit(log_func, x, y, p0=[coeffs[0], coeffs[1]])
+            popt: np.ndarray = np.asarray(result[0])
 
-        y_pred = log_func(x, *popt)
+        y_pred = log_func(x, popt[0], popt[1])
         rmse = compute_rmse(y, y_pred)
         aic = compute_aic(len(x), rmse ** 2, 2)
 
-        def evaluate(x_new):
-            return log_func(x_new, *popt)
+        def evaluate(x_eval):
+            return log_func(x_eval, popt[0], popt[1])
 
         return FittedModel(
             name="Logarithmic",
@@ -206,19 +219,21 @@ def fit_logarithmic(x: np.ndarray, y: np.ndarray) -> Optional[FittedModel]:
             rmse=rmse,
             aic=aic,
             complexity=3.0,
-            params={"A": popt[0], "B": popt[1]}
+            params={"A": float(popt[0]), "B": float(popt[1])}
         )
-    except:
+    except (RuntimeError, ValueError, TypeError):
         return None
 
 
-def fit_spline(x: np.ndarray, y: np.ndarray) -> FittedModel:
+def fit_spline(x: np.ndarray, y: np.ndarray, accuracy: float) -> FittedModel:
     sorted_indices = np.argsort(x)
     x_sorted = x[sorted_indices]
     y_sorted = y[sorted_indices]
 
     noise_estimate = np.std(np.diff(y_sorted)) / np.sqrt(2)
-    s = len(x) * noise_estimate ** 2
+    s_base = len(x) * noise_estimate ** 2
+
+    s = s_base * (accuracy / 0.01)
 
     try:
         spline = UnivariateSpline(x_sorted, y_sorted, s=s, k=3)
@@ -229,8 +244,8 @@ def fit_spline(x: np.ndarray, y: np.ndarray) -> FittedModel:
         n_knots = len(knots)
         aic = compute_aic(len(x), rmse ** 2, n_knots + 4)
 
-        def evaluate(x_new):
-            return spline(x_new)
+        def evaluate(x_eval):
+            return spline(x_eval)
 
         return FittedModel(
             name=f"Cubic Spline ({n_knots} knots)",
@@ -241,7 +256,7 @@ def fit_spline(x: np.ndarray, y: np.ndarray) -> FittedModel:
             complexity=n_knots * 0.3,
             params={"spline": spline, "knots": knots}
         )
-    except:
+    except (ValueError, TypeError):
         spline = CubicSpline(x_sorted, y_sorted)
         y_pred = spline(x_sorted)
         rmse = compute_rmse(y_sorted, y_pred)
@@ -249,8 +264,8 @@ def fit_spline(x: np.ndarray, y: np.ndarray) -> FittedModel:
         n_segments = len(x_sorted) - 1
         aic = compute_aic(len(x), rmse ** 2, n_segments * 4)
 
-        def evaluate(x_new):
-            return spline(x_new)
+        def evaluate(x_eval):
+            return spline(x_eval)
 
         return FittedModel(
             name=f"Cubic Spline ({n_segments} segments)",
@@ -264,7 +279,7 @@ def fit_spline(x: np.ndarray, y: np.ndarray) -> FittedModel:
 
 
 def fit_piecewise(x: np.ndarray, y: np.ndarray,
-                  segments: List[Tuple[int, int]]) -> Optional[FittedModel]:
+                  segments: List[Tuple[int, int]], accuracy: float) -> Optional[FittedModel]:
     if len(segments) <= 1:
         return None
 
@@ -279,7 +294,7 @@ def fit_piecewise(x: np.ndarray, y: np.ndarray,
         if len(x_seg) < 4:
             return None
 
-        seg_models = fit_models(x_seg, y_seg, [(0, len(x_seg) - 1)])
+        seg_models = fit_models(x_seg, y_seg, [(0, len(x_seg) - 1)], accuracy)
 
         if not seg_models:
             return None
@@ -292,11 +307,11 @@ def fit_piecewise(x: np.ndarray, y: np.ndarray,
 
     total_rmse /= len(x)
 
-    def evaluate(x_new):
-        y_new = np.zeros_like(x_new)
+    def evaluate(x_eval):
+        y_new = np.zeros_like(x_eval)
         for x_min, x_max, model in segment_models:
-            mask = (x_new >= x_min) & (x_new <= x_max)
-            y_new[mask] = model.evaluate(x_new[mask])
+            mask = (x_eval >= x_min) & (x_eval <= x_max)
+            y_new[mask] = model.evaluate(x_eval[mask])
         return y_new
 
     aic = compute_aic(len(x), total_rmse ** 2, int(total_complexity))
@@ -313,19 +328,21 @@ def fit_piecewise(x: np.ndarray, y: np.ndarray,
 
 
 def fit_models(x: np.ndarray, y: np.ndarray,
-               segments: List[Tuple[int, int]]) -> List[FittedModel]:
+               segments: List[Tuple[int, int]], accuracy: float = 0.01) -> List[FittedModel]:
     models = []
 
+    accuracy = max(0.0001, accuracy)
+
     if len(segments) > 1:
-        piecewise_model = fit_piecewise(x, y, segments)
+        piecewise_model = fit_piecewise(x, y, segments, accuracy)
         if piecewise_model:
             models.append(piecewise_model)
 
-    poly_model = fit_polynomial(x, y)
+    poly_model = fit_polynomial(x, y, accuracy)
     if poly_model:
         models.append(poly_model)
 
-    sin_model = fit_sinusoidal(x, y)
+    sin_model = fit_sinusoidal(x, y, accuracy)
     if sin_model:
         models.append(sin_model)
 
@@ -337,7 +354,7 @@ def fit_models(x: np.ndarray, y: np.ndarray,
     if log_model:
         models.append(log_model)
 
-    spline_model = fit_spline(x, y)
+    spline_model = fit_spline(x, y, accuracy)
     models.append(spline_model)
 
     return models
@@ -355,7 +372,8 @@ def select_best_model(models: List[FittedModel], x: np.ndarray, y: np.ndarray) -
     best_idx = np.argmin(scores)
 
     if len(models) > 1:
-        second_best_idx = np.argsort(scores)[1]
+        sorted_scores = np.argsort(scores)
+        second_best_idx = sorted_scores[1]
         if abs(scores[best_idx] - scores[second_best_idx]) < 0.05 * scores[best_idx]:
             if models[best_idx].complexity > models[second_best_idx].complexity:
                 return models[second_best_idx]

@@ -42,11 +42,11 @@ def smooth_curve(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     try:
         y_smooth = savgol_filter(y, window_length, polyorder)
         return x, y_smooth
-    except:
+    except (ValueError, TypeError):
         return x, y
 
 
-def remove_outliers(x: np.ndarray, y: np.ndarray, domain_width: float) -> Tuple[np.ndarray, np.ndarray]:
+def remove_outliers(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if len(x) < 5:
         return x, y
 
@@ -122,7 +122,7 @@ def preprocess_stroke(x: np.ndarray, y: np.ndarray, domain_width: float,
 
     x_smooth, y_smooth = smooth_curve(x_resampled, y_resampled)
 
-    x_clean, y_clean = remove_outliers(x_smooth, y_smooth, domain_width)
+    x_clean, y_clean = remove_outliers(x_smooth, y_smooth)
 
     if len(x_clean) > 50:
         points = np.column_stack((x_clean, y_clean))
