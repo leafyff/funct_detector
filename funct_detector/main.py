@@ -1,8 +1,22 @@
 """
-Function Drawer and LaTeX Generator.
+Function Drawer and LaTeX Generator — 12 canonical models.
 
-Draw a curve in a coordinate system, approximate it as y = f(x), and show a LaTeX
-representation of the best fitting model.
+Mathematical methods
+--------------------
+1.  Cubic Spline                             scipy.interpolate.CubicSpline
+2.  Interpolation polynomial (Chebyshev)     Chebyshev.fit at CGL nodes
+3.  L-inf minimax polynomial                 scipy.optimize.linprog / HiGHS
+4.  Polynomial Least Squares (Chebyshev)     numpy.polynomial.Chebyshev.fit
+5.  Non-Uniform Fast Fourier Transform       LS trigonometric regression (NUFFT type-1 pseudoinverse)
+6.  AAA Algorithm                            scipy.interpolate.AAA (Nakatsukasa–Sete–Trefethen 2018)
+7.  Exponential curve                        A·exp(B·x) + C
+8.  Logarithmic curve                        A·ln(x+shift) + B
+9.  Rational curve                           A + B/(x−D)
+10. Sinusoidal curve                         A·sin(2π·f·x + φ) + B
+11. Tangential curve                         A·tan(B·x + C) + D
+12. Arctan (S-curve)                         A·arctan(B·x + C) + D
+
+Scoring:  Score = α·L∞/σ + β·RMSE/σ + γ·complexity
 """
 
 from __future__ import annotations
@@ -16,9 +30,10 @@ from typing import Any, Callable, Mapping, Optional
 import numpy as np
 import pyqtgraph as pg
 import sympy as sp
+from numpy.polynomial import Chebyshev, Polynomial
 from numpy.typing import NDArray
-from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QCursor, QMouseEvent
+from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QThread, Signal
+from PySide6.QtGui import QCursor, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -32,21 +47,37 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-from scipy.interpolate import CubicSpline, UnivariateSpline, interp1d
-from scipy.optimize import curve_fit
-from scipy.signal import savgol_filter
+from scipy.interpolate import AAA, CubicSpline, UnivariateSpline, make_interp_spline
+from scipy.optimize import curve_fit, linprog
+from scipy.signal import lombscargle, savgol_filter
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
 
 FloatArray = NDArray[np.floating[Any]]
 EvaluationFunction = Callable[[FloatArray], FloatArray]
 
+# ---------------------------------------------------------------------------
+# Scoring weights: Score = ALPHA*(L_inf/s) + BETA*(RMSE/s) + GAMMA*complexity
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
+ALPHA: float = 0.4
+BETA: float = 0.4
+GAMMA: float = 0.2
+
+# All models shown; only the top N get their checkbox checked ON.
+N_TOP_CHECKED: int = 2
+
+
+# ===========================================================================
+# Data-classes
+# ===========================================================================
 
 @dataclass(frozen=True, slots=True)
 class PlotSettings:
@@ -56,16 +87,20 @@ class PlotSettings:
     y_max: float = 10.0
     grid_spacing: float = 1.0
     accuracy: float = 0.0001
+    latex_approx: bool = True    # use decimal approximations in LaTeX output
+    latex_decimals: int = 3      # digits after decimal point when approx is on
 
     def __post_init__(self) -> None:
         if self.x_min >= self.x_max:
-            raise ValueError(f"x_min ({self.x_min}) must be less than x_max ({self.x_max})")
+            raise ValueError(f"x_min ({self.x_min}) must be < x_max ({self.x_max})")
         if self.y_min >= self.y_max:
-            raise ValueError(f"y_min ({self.y_min}) must be less than y_max ({self.y_max})")
+            raise ValueError(f"y_min ({self.y_min}) must be < y_max ({self.y_max})")
         if self.grid_spacing <= 0:
-            raise ValueError(f"grid_spacing ({self.grid_spacing}) must be positive")
+            raise ValueError(f"grid_spacing must be positive, got {self.grid_spacing}")
         if not (0.0001 <= self.accuracy <= 1.0):
-            raise ValueError(f"accuracy ({self.accuracy}) must be between 0.0001 and 1.0")
+            raise ValueError(f"accuracy must be in [0.0001, 1.0], got {self.accuracy}")
+        if not (0 <= self.latex_decimals <= 10):
+            raise ValueError(f"latex_decimals must be in [0, 10], got {self.latex_decimals}")
 
     @property
     def domain_width(self) -> float:
@@ -82,24 +117,32 @@ class FittedModel:
     evaluate: EvaluationFunction
     latex_kind: str
     rmse: float
-    aic: float
+    l_inf: float
+    bic: float
     complexity: float
     params: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.rmse < 0:
             raise ValueError(f"RMSE cannot be negative: {self.rmse}")
+        if self.l_inf < 0:
+            raise ValueError(f"L-inf cannot be negative: {self.l_inf}")
         if self.complexity < 0:
-            raise ValueError(f"Complexity cannot be negative: {self.complexity}")
+            raise ValueError(f"complexity cannot be negative: {self.complexity}")
         if not callable(self.evaluate):
             raise ValueError("evaluate must be callable")
 
+    def score(self, y_scale: float = 1.0) -> float:
+        s = y_scale if y_scale > 0 else 1.0
+        return ALPHA * self.l_inf / s + BETA * self.rmse / s + GAMMA * self.complexity
 
-# ---------------------------------------------------------------------------
-# Model fitters
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# Abstract base fitter
+# ===========================================================================
 
 class ModelFitter(ABC):
+
     @abstractmethod
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         raise NotImplementedError
@@ -109,509 +152,1421 @@ class ModelFitter(ABC):
         return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
     @staticmethod
-    def _aic(n: int, mse: float, k: int) -> float:
-        if mse <= 0:
-            return float("inf")
-        return float(n * np.log(mse) + 2 * k)
+    def _l_inf(y_true: FloatArray, y_pred: FloatArray) -> float:
+        return float(np.max(np.abs(y_true - y_pred)))
 
     @staticmethod
-    def _linear_fit_r2(x: FloatArray, y: FloatArray) -> tuple[FloatArray, float]:
-        coeffs = np.polyfit(x, y, 1)
-        y_pred = np.polyval(coeffs, x)
-        y_var = float(np.var(y))
-        if y_var <= 0:
-            return coeffs, 0.0
-        r2 = 1.0 - float(np.var(y - y_pred)) / y_var
-        return coeffs, r2
+    def _bic(n: int, mse: float, k: int) -> float:
+        if mse <= 0:
+            return float("inf")
+        return float(n * np.log(mse) + k * np.log(n))
+
+    @staticmethod
+    def _r2(y_true: FloatArray, y_pred: FloatArray) -> float:
+        ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+        if ss_tot <= 0:
+            return 0.0
+        return 1.0 - float(np.sum((y_true - y_pred) ** 2)) / ss_tot
+
+    @staticmethod
+    def _linear_prefit(u: FloatArray, v: FloatArray) -> tuple[float, float, float]:
+        """Least-squares linear fit v ~ a*u + b.  Returns (slope, intercept, R²)."""
+        p = Polynomial.fit(u, v, 1)
+        coef = p.convert().coef        # [intercept, slope] in original domain
+        v_pred = np.asarray(p(u), dtype=np.float64)
+        ss_tot = float(np.sum((v - float(np.mean(v))) ** 2))
+        r2 = 1.0 - float(np.sum((v - v_pred) ** 2)) / ss_tot if ss_tot > 0 else 0.0
+        return float(coef[1]), float(coef[0]), r2
+
+    @staticmethod
+    def _reject_fit(y: FloatArray, y_pred: FloatArray, rmse: float, threshold: float) -> bool:
+        """Return True when the fit is too poor to keep (rmse/std > threshold)."""
+        if not np.all(np.isfinite(y_pred)):
+            return True
+        y_std = float(np.std(y))
+        return y_std > 0 and rmse / y_std > threshold
+
+    @staticmethod
+    def _validate_basic_data(
+        x: FloatArray, y: FloatArray, min_points: int = 8
+    ) -> Optional[tuple[int, float, float]]:
+        """Validate basic data requirements.
+
+        Returns (n, y_std, x_span) if valid, None otherwise.
+        """
+        n = len(x)
+        if n < min_points:
+            return None
+        y_std = float(np.std(y))
+        if y_std <= 0:
+            return None
+        x_span = float(x[-1] - x[0])
+        if x_span <= 0:
+            return None
+        return n, y_std, x_span
+
+    @staticmethod
+    def _validate_fitted_result(
+        y: FloatArray, y_pred: FloatArray, y_std: float, threshold: float = 0.9
+    ) -> bool:
+        """Check if fitted result is acceptable.
+
+        Returns True if valid, False otherwise.
+        """
+        if not np.all(np.isfinite(y_pred)):
+            return False
+        if y_std > 0:
+            rmse = float(np.sqrt(np.mean((y - y_pred) ** 2)))
+            if rmse / y_std > threshold:
+                return False
+        return True
 
 
-class PolynomialFitter(ModelFitter):
-    def __init__(self, max_degree: int = 15) -> None:
+# ===========================================================================
+# Chebyshev polynomial fitter
+# Replaces manual Vandermonde+lstsq with np.polynomial.Chebyshev.fit.
+# Domain mapping to [-1,1] is handled internally; no manual rescaling needed.
+# ===========================================================================
+
+class ChebyshevPolynomialFitter(ModelFitter):
+
+    def __init__(self, max_degree: int = 14) -> None:
         self._max_degree = max_degree
 
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
-        best_degree: Optional[int] = None
-        best_aic: float = float("inf")
-        best_coeffs: Optional[FloatArray] = None
+        if len(x) < 3:
+            return None
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        if x_max - x_min < 1e-12:
+            return None
 
-        target_rmse = max(0.0001, float(accuracy))
-        max_degree = min(self._max_degree, max(1, len(x) - 1))
+        max_degree = min(self._max_degree, len(x) - 1)
+        y_scale = float(np.std(y)) or 1.0
+
+        best_score = float("inf")
+        best_degree = 1
+        best_fit: Optional[Chebyshev] = None
 
         for degree in range(1, max_degree + 1):
             try:
-                coeffs = np.polyfit(x, y, degree)
-                y_pred = np.asarray(np.polyval(coeffs, x), dtype=np.float64)
+                # Chebyshev.fit: least-squares in Chebyshev basis.
+                # domain=[x_min, x_max] stored on object; c(x) evaluates correctly.
+                c = Chebyshev.fit(x, y, degree, domain=[x_min, x_max])
+                y_pred = np.asarray(c(x), dtype=np.float64)
                 rmse = self._rmse(y, y_pred)
-
-                mse = rmse * rmse
-                aic = self._aic(len(x), mse, degree + 1)
-
-                penalty = 0.5 * degree if degree > 8 else 0.0
-                score = aic + penalty
-
-                if score < best_aic:
-                    best_aic = score
-                    best_degree = degree
-                    best_coeffs = coeffs
-
-                if rmse < target_rmse and degree > 1:
+                l_inf = self._l_inf(y, y_pred)
+                complexity = float(degree) * 0.5
+                s = ALPHA * l_inf / y_scale + BETA * rmse / y_scale + GAMMA * complexity
+                if s < best_score:
+                    best_score, best_degree, best_fit = s, degree, c
+                if rmse < max(1e-9, float(accuracy)) and degree > 1:
                     break
             except (np.linalg.LinAlgError, ValueError):
                 continue
 
-        if best_coeffs is None or best_degree is None:
+        if best_fit is None:
             return None
 
-        # Capture as plain Python objects to avoid the
-        # "ndarray | iterable | int | float" subscript warnings
-        # that arise when numpy arrays are closed over directly.
-        captured_coeffs: list[float] = [float(c) for c in best_coeffs]
-        y_pred_best = np.asarray(np.polyval(captured_coeffs, x), dtype=np.float64)
-        rmse_best = self._rmse(y, y_pred_best)
+        y_pred_f = np.asarray(best_fit(x), dtype=np.float64)
+        rmse_f = self._rmse(y, y_pred_f)
+        l_inf_f = self._l_inf(y, y_pred_f)
+        bic_f = self._bic(len(x), max(rmse_f ** 2, 1e-300), best_degree + 1)
+        cheb_obj = best_fit
 
         def evaluate(x_eval: FloatArray) -> FloatArray:
-            return np.asarray(np.polyval(captured_coeffs, x_eval), dtype=np.float64)
+            return np.asarray(cheb_obj(x_eval), dtype=np.float64)
 
         return FittedModel(
-            name=f"Polynomial (degree {best_degree})",
+            name="Polynomial Least Squares Approximation (Chebyshev Basis)",
             evaluate=evaluate,
-            latex_kind="polynomial",
-            rmse=rmse_best,
-            aic=best_aic,
+            latex_kind="chebyshev",
+            rmse=rmse_f,
+            l_inf=l_inf_f,
+            bic=bic_f,
             complexity=float(best_degree) * 0.5,
-            params={"coeffs": captured_coeffs, "degree": best_degree},
+            params={
+                "cheb_coef": list(best_fit.coef),   # coefficients in Chebyshev basis
+                "domain": [x_min, x_max],
+                "degree": best_degree,
+            },
         )
 
 
+# ===========================================================================
+# Sinusoidal fitter  A*sin(2*pi*f*x + phi) + B
+# ===========================================================================
+
 class SinusoidalFitter(ModelFitter):
+
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         try:
-            dx = np.diff(x)
-            if len(dx) == 0:
-                return None
-            step = float(np.mean(dx))
-            if not np.isfinite(step) or step == 0.0:
+            n = len(x)
+            if n < 8:
                 return None
 
-            y_centered = y - np.mean(y)
-            y_fft = np.fft.fft(y_centered)
-            freqs = np.fft.fftfreq(len(x), step)
-
-            half = max(1, len(freqs) // 2)
-            positive_freqs = freqs[:half]
-            positive_fft = np.abs(y_fft[:half])
-
-            if len(positive_fft) < 2:
+            order = np.argsort(x)
+            xs: FloatArray = x[order]
+            ys: FloatArray = y[order]
+            x_span = float(xs[-1] - xs[0])
+            if x_span <= 0:
                 return None
 
-            dominant_idx = int(np.argmax(positive_fft[1:]) + 1)
-            f0 = float(np.abs(positive_freqs[dominant_idx]))
-            if f0 == 0.0:
+            f_min = 1.0 / x_span
+            f_max = float(n) / (2.0 * x_span)
+            if f_max <= f_min:
                 return None
 
-            total_power = float(np.sum(positive_fft))
-            if total_power <= 0:
-                return None
-            power_ratio = float(positive_fft[dominant_idx]) / total_power
-            if power_ratio < 0.4:
-                return None
-
-            a_init = float(2 * positive_fft[dominant_idx] / len(x))
-            b_init = float(np.mean(y))
-            phase_init = 0.0
-
-            def sin_func(
-                x_vals: FloatArray,
-                amplitude: float,
-                freq: float,
-                phase: float,
-                offset: float,
-            ) -> FloatArray:
-                return np.asarray(
-                    amplitude * np.sin(2 * np.pi * freq * x_vals + phase) + offset,
-                    dtype=np.float64,
-                )
-
+            ang_freqs = np.linspace(2.0 * np.pi * f_min, 2.0 * np.pi * f_max, 512)
+            y_c = ys - float(np.mean(ys))
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                fit_result = curve_fit(
-                    sin_func,
-                    x,
-                    y,
-                    p0=[a_init, f0, phase_init, b_init],
-                    maxfev=5000,
+                power: FloatArray = np.asarray(
+                    lombscargle(xs, y_c, ang_freqs, normalize=True), dtype=np.float64
                 )
-            popt: FloatArray = np.asarray(fit_result[0], dtype=np.float64)
 
-            # Unpack to plain Python floats to avoid ndarray subscript warnings
-            amp = float(popt[0])
-            freq = float(popt[1])
-            phase = float(popt[2])
-            off = float(popt[3])
-
-            y_pred = sin_func(x, amp, freq, phase, off)
-            rmse = self._rmse(y, y_pred)
-
-            target_rmse = max(0.0001, float(accuracy))
-            y_std = float(np.std(y))
-            if y_std > 0 and (rmse / y_std > 0.5 or rmse > target_rmse * 10):
+            peak_idx = int(np.argmax(power))
+            if float(power[peak_idx]) < 0.25:
+                return None
+            f0 = float(ang_freqs[peak_idx]) / (2.0 * np.pi)
+            if f0 <= 0:
                 return None
 
-            aic = self._aic(len(x), rmse * rmse, 4)
+            amp_init = float(np.std(ys) * np.sqrt(2))
+            off_init = float(np.mean(ys))
+            y_std = float(np.std(ys))
+
+            def _sin(xv: FloatArray, a: float, f: float, p: float, b: float) -> FloatArray:
+                return np.asarray(a * np.sin(2.0 * np.pi * f * xv + p) + b, dtype=np.float64)
+
+            best_rmse = float("inf")
+            best_popt: Optional[FloatArray] = None
+
+            for phase_guess in (0.0, np.pi / 2, np.pi, -np.pi / 2):
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        res = curve_fit(
+                            _sin, xs, ys,
+                            p0=[amp_init, f0, phase_guess, off_init],
+                            maxfev=10000,
+                            bounds=(
+                                [-np.inf, f_min * 0.5, -np.pi, -np.inf],
+                                [np.inf, f_max * 2.0, np.pi, np.inf],
+                            ),
+                        )
+                    popt = np.asarray(res[0], dtype=np.float64)
+                    r = self._rmse(ys, _sin(xs, *popt))
+                    if r < best_rmse:
+                        best_rmse, best_popt = r, popt
+                except (RuntimeError, ValueError):
+                    continue
+
+            if best_popt is None:
+                return None
+
+            sin_a, sin_f, sin_p, sin_b = (float(best_popt[k]) for k in range(4))
+            y_pred = _sin(xs, sin_a, sin_f, sin_p, sin_b)
+            if not np.all(np.isfinite(y_pred)):
+                return None
+
+            rmse = self._rmse(ys, y_pred)
+            if y_std > 0 and rmse / y_std > 0.8:
+                return None
+
+            l_inf = self._l_inf(ys, y_pred)
+            bic = self._bic(n, max(rmse ** 2, 1e-300), 4)
 
             def evaluate(x_eval: FloatArray) -> FloatArray:
-                return sin_func(x_eval, amp, freq, phase, off)
+                return _sin(x_eval, sin_a, sin_f, sin_p, sin_b)
 
             return FittedModel(
-                name="Sinusoidal",
+                name="Sinusoidal curve",
                 evaluate=evaluate,
                 latex_kind="sinusoidal",
                 rmse=rmse,
-                aic=aic,
+                l_inf=l_inf,
+                bic=bic,
                 complexity=3.0,
-                params={"A": amp, "f": freq, "phase": phase, "B": off},
+                params={"A": sin_a, "f": sin_f, "phase": sin_p, "B": sin_b},
             )
-        except (
-            RuntimeError,
-            ValueError,
-            TypeError,
-            IndexError,
-            np.linalg.LinAlgError,
-            FloatingPointError,
-        ):
+        except (RuntimeError, ValueError, TypeError, FloatingPointError, np.linalg.LinAlgError):
             return None
 
 
+# ===========================================================================
+# Exponential fitter  A*exp(B*x) + C
+# ===========================================================================
+
 class ExponentialFitter(ModelFitter):
+
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         try:
-            if np.all(y > 0):
-                y_log = np.log(y)
-                sign = 1.0
-            elif np.all(y < 0):
-                y_log = np.log(-y)
-                sign = -1.0
-            else:
+            y_min = float(np.min(y))
+            y_range = float(np.ptp(y))
+            shift = max(0.0, -y_min + 1e-6 * max(1.0, y_range)) if y_min <= 0 else 0.0
+
+            # Log-space linear pre-fit for initial guess
+            y_log = np.log(y + shift)
+            b_init, log_a0, r2_pre = self._linear_prefit(x, y_log)
+            if r2_pre < 0.70:
                 return None
+            a_init = float(np.exp(log_a0))
 
-            coeffs, r2 = self._linear_fit_r2(x, y_log)
-            if r2 < 0.85:
-                return None
-
-            def exp_func(
-                x_vals: FloatArray, amplitude: float, rate: float, offset: float
-            ) -> FloatArray:
-                return np.asarray(
-                    amplitude * np.exp(rate * x_vals) + offset, dtype=np.float64
-                )
-
-            a_init = float(sign * np.exp(float(coeffs[1])))
-            b_init = float(coeffs[0])
-            c_init = 0.0
+            def _exp(xv: FloatArray, a: float, b: float, c: float) -> FloatArray:
+                return np.asarray(a * np.exp(b * xv) + c, dtype=np.float64)
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                fit_result = curve_fit(
-                    exp_func,
-                    x,
-                    y,
-                    p0=[a_init, b_init, c_init],
-                    maxfev=5000,
-                )
-            popt: FloatArray = np.asarray(fit_result[0], dtype=np.float64)
+                res = curve_fit(_exp, x, y, p0=[a_init, b_init, 0.0], maxfev=10000)
+            popt = np.asarray(res[0], dtype=np.float64)
+            exp_a, exp_b, exp_c = float(popt[0]), float(popt[1]), float(popt[2])
 
-            amp = float(popt[0])
-            rate = float(popt[1])
-            off = float(popt[2])
-
-            y_pred = exp_func(x, amp, rate, off)
+            y_pred = _exp(x, exp_a, exp_b, exp_c)
             rmse = self._rmse(y, y_pred)
-            target_rmse = max(0.0001, float(accuracy))
-            if rmse > target_rmse * 10:
+            if self._reject_fit(y, y_pred, rmse, 0.9):
                 return None
-            aic = self._aic(len(x), rmse * rmse, 3)
+
+            l_inf = self._l_inf(y, y_pred)
+            bic = self._bic(len(x), max(rmse ** 2, 1e-300), 3)
 
             def evaluate(x_eval: FloatArray) -> FloatArray:
-                return exp_func(x_eval, amp, rate, off)
+                return _exp(x_eval, exp_a, exp_b, exp_c)
 
             return FittedModel(
-                name="Exponential",
+                name="Exponential curve",
                 evaluate=evaluate,
                 latex_kind="exponential",
                 rmse=rmse,
-                aic=aic,
+                l_inf=l_inf,
+                bic=bic,
                 complexity=3.0,
-                params={"A": amp, "B": rate, "C": off},
+                params={"A": exp_a, "B": exp_b, "C": exp_c},
             )
-        except (
-            RuntimeError,
-            ValueError,
-            TypeError,
-            OverflowError,
-            np.linalg.LinAlgError,
-            FloatingPointError,
-        ):
+        except (RuntimeError, ValueError, TypeError, OverflowError,
+                np.linalg.LinAlgError, FloatingPointError):
             return None
 
 
+# ===========================================================================
+# Logarithmic fitter  A*ln(x + shift) + B
+# ===========================================================================
+
 class LogarithmicFitter(ModelFitter):
+
     def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
         try:
-            if not np.all(x > 0):
+            x_min = float(np.min(x))
+            shift = max(0.0, -x_min + 1e-6 * max(1.0, float(np.ptp(x)))) if x_min <= 0 else 0.0
+            x_log = np.log(x + shift)
+
+            # Linear pre-fit for initial guess
+            a_init, b_init, r2_pre = self._linear_prefit(x_log, y)
+            if r2_pre < 0.70:
                 return None
 
-            x_log = np.log(x)
-            coeffs, r2 = self._linear_fit_r2(x_log, y)
-            if r2 < 0.85:
-                return None
+            log_shift = shift
 
-            def log_func(x_vals: FloatArray, amplitude: float, offset: float) -> FloatArray:
-                return np.asarray(
-                    amplitude * np.log(x_vals) + offset, dtype=np.float64
-                )
+            def _log(xv: FloatArray, a: float, b: float) -> FloatArray:
+                return np.asarray(a * np.log(xv + log_shift) + b, dtype=np.float64)
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                fit_result = curve_fit(
-                    log_func,
-                    x,
-                    y,
-                    p0=[float(coeffs[0]), float(coeffs[1])],
-                )
-            popt: FloatArray = np.asarray(fit_result[0], dtype=np.float64)
+                res = curve_fit(_log, x, y, p0=[a_init, b_init], maxfev=10000)
+            popt = np.asarray(res[0], dtype=np.float64)
+            log_a, log_b = float(popt[0]), float(popt[1])
 
-            amp = float(popt[0])
-            off = float(popt[1])
-
-            y_pred = log_func(x, amp, off)
+            y_pred = _log(x, log_a, log_b)
             rmse = self._rmse(y, y_pred)
-            target_rmse = max(0.0001, float(accuracy))
-            if rmse > target_rmse * 10:
+            if self._reject_fit(y, y_pred, rmse, 0.9):
                 return None
-            aic = self._aic(len(x), rmse * rmse, 2)
+
+            l_inf = self._l_inf(y, y_pred)
+            bic = self._bic(len(x), max(rmse ** 2, 1e-300), 2)
 
             def evaluate(x_eval: FloatArray) -> FloatArray:
-                return log_func(x_eval, amp, off)
+                return _log(x_eval, log_a, log_b)
 
             return FittedModel(
-                name="Logarithmic",
+                name="Logarithmic curve",
                 evaluate=evaluate,
                 latex_kind="logarithmic",
                 rmse=rmse,
-                aic=aic,
-                complexity=3.0,
-                params={"A": amp, "B": off},
+                l_inf=l_inf,
+                bic=bic,
+                complexity=2.5,
+                params={"A": log_a, "B": log_b, "shift": shift},
             )
-        except (
-            RuntimeError,
-            ValueError,
-            TypeError,
-            np.linalg.LinAlgError,
-            FloatingPointError,
-        ):
+        except (RuntimeError, ValueError, TypeError, np.linalg.LinAlgError, FloatingPointError):
             return None
 
 
-class SplineFitter(ModelFitter):
-    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
-        sorted_indices = np.argsort(x)
-        x_sorted: FloatArray = x[sorted_indices]
-        y_sorted: FloatArray = y[sorted_indices]
+# ===========================================================================
+# Rational fitter  A + B/(x - D)
+# ===========================================================================
 
-        noise_estimate = (
-            float(np.std(np.diff(y_sorted)) / np.sqrt(2)) if len(y_sorted) > 1 else 0.1
-        )
-        s_base = len(x_sorted) * noise_estimate * noise_estimate
-        s = s_base * (float(accuracy) / 0.01)
+class RationalFitter(ModelFitter):
+
+    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
+        try:
+            if len(x) < 6:
+                return None
+
+            x_lo, x_hi = float(np.min(x)), float(np.max(x))
+            x_rng = x_hi - x_lo
+            y_mean, y_std = float(np.mean(y)), float(np.std(y))
+
+            def _rat(xv: FloatArray, a: float, b: float, d: float) -> FloatArray:
+                denom = xv - d
+                safe = np.where(np.abs(denom) < 1e-9, np.sign(denom) * 1e-9, denom)
+                return np.asarray(a + b / safe, dtype=np.float64)
+
+            best_rmse = float("inf")
+            best_popt: Optional[FloatArray] = None
+
+            for d_cand in (
+                x_lo - 0.5 * x_rng, x_lo - 0.1 * x_rng,
+                x_hi + 0.1 * x_rng, x_hi + 0.5 * x_rng,
+                x_lo - x_rng, x_hi + x_rng,
+            ):
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        res = curve_fit(
+                            _rat, x, y,
+                            p0=[y_mean, y_std * x_rng, d_cand],
+                            maxfev=10000,
+                        )
+                    popt = np.asarray(res[0], dtype=np.float64)
+                    d_fit = float(popt[2])
+                    if x_lo < d_fit < x_hi:
+                        continue
+                    r = self._rmse(y, _rat(x, float(popt[0]), float(popt[1]), d_fit))
+                    if r < best_rmse:
+                        best_rmse, best_popt = r, popt
+                except (RuntimeError, ValueError):
+                    continue
+
+            if best_popt is None:
+                return None
+
+            rat_a, rat_b, rat_d = float(best_popt[0]), float(best_popt[1]), float(best_popt[2])
+            y_pred = _rat(x, rat_a, rat_b, rat_d)
+            if not np.all(np.isfinite(y_pred)):
+                return None
+
+            rmse = self._rmse(y, y_pred)
+            if y_std > 0 and rmse / y_std > 0.9:
+                return None
+
+            l_inf = self._l_inf(y, y_pred)
+            bic = self._bic(len(x), max(rmse ** 2, 1e-300), 3)
+
+            def evaluate(x_eval: FloatArray) -> FloatArray:
+                return _rat(x_eval, rat_a, rat_b, rat_d)
+
+            return FittedModel(
+                name="Rational curve",
+                evaluate=evaluate,
+                latex_kind="rational",
+                rmse=rmse,
+                l_inf=l_inf,
+                bic=bic,
+                complexity=3.5,
+                params={"A": rat_a, "B": rat_b, "D": rat_d},
+            )
+        except (RuntimeError, ValueError, TypeError, OverflowError,
+                np.linalg.LinAlgError, FloatingPointError):
+            return None
+
+
+# ===========================================================================
+# Arctan fitter  A*arctan(B*x + C) + D
+# Continuous S-curve without the branch-cut discontinuities of tan(x).
+# ===========================================================================
+
+class ArctanFitter(ModelFitter):
+
+    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
+        try:
+            validation = self._validate_basic_data(x, y, min_points=8)
+            if validation is None:
+                return None
+            n, y_std, x_span = validation
+
+            def _atan(xv: FloatArray, a: float, b: float, c: float, d: float) -> FloatArray:
+                return np.asarray(a * np.arctan(b * xv + c) + d, dtype=np.float64)
+
+            best_rmse = float("inf")
+            best_popt: Optional[FloatArray] = None
+
+            for b_seed in (1.0 / x_span, 2.0 / x_span, 0.5 / x_span, 1.0):
+                for c_seed in (0.0, np.pi / 4, -np.pi / 4):
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            res = curve_fit(
+                                _atan, x, y,
+                                p0=[y_std, b_seed, c_seed, float(np.mean(y))],
+                                maxfev=10000,
+                            )
+                        popt = np.asarray(res[0], dtype=np.float64)
+                        yp = _atan(x, *popt)
+                        if not np.all(np.isfinite(yp)):
+                            continue
+                        r = self._rmse(y, yp)
+                        if r < best_rmse:
+                            best_rmse, best_popt = r, popt
+                    except (RuntimeError, ValueError):
+                        continue
+
+            if best_popt is None:
+                return None
+
+            at_a, at_b, at_c, at_d = (float(best_popt[k]) for k in range(4))
+            y_pred = _atan(x, at_a, at_b, at_c, at_d)
+
+            if not self._validate_fitted_result(y, y_pred, y_std):
+                return None
+
+            rmse = self._rmse(y, y_pred)
+            l_inf = self._l_inf(y, y_pred)
+            bic = self._bic(n, max(rmse ** 2, 1e-300), 4)
+
+            def evaluate(x_eval: FloatArray) -> FloatArray:
+                return _atan(x_eval, at_a, at_b, at_c, at_d)
+
+            return FittedModel(
+                name="Arctan (S-curve)",
+                evaluate=evaluate,
+                latex_kind="arctan",
+                rmse=rmse,
+                l_inf=l_inf,
+                bic=bic,
+                complexity=4.0,
+                params={"A": at_a, "B": at_b, "C": at_c, "D": at_d},
+            )
+        except (RuntimeError, ValueError, TypeError, np.linalg.LinAlgError, FloatingPointError):
+            return None
+
+
+# ===========================================================================
+# Cubic spline fitter
+# ===========================================================================
+
+class SplineFitter(ModelFitter):
+
+    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
+        idx = np.argsort(x)
+        xs: FloatArray = x[idx]
+        ys: FloatArray = y[idx]
+
+        noise = float(np.std(np.diff(ys)) / np.sqrt(2)) if len(ys) > 1 else 0.1
+        s = len(xs) * noise ** 2 * (float(accuracy) / 0.01)
 
         try:
-            spline = UnivariateSpline(x_sorted, y_sorted, s=s, k=3)
-            y_pred = np.asarray(spline(x_sorted), dtype=np.float64)
-            rmse = self._rmse(y_sorted, y_pred)
-
-            knots = np.asarray(spline.get_knots(), dtype=np.float64)
-            k_count = int(len(knots))
-            aic = self._aic(len(x_sorted), rmse * rmse, k_count + 4)
+            spline = UnivariateSpline(xs, ys, s=s, k=3)
+            y_pred = np.asarray(spline(xs), dtype=np.float64)
+            rmse = self._rmse(ys, y_pred)
+            l_inf = self._l_inf(ys, y_pred)
+            knots = int(len(spline.get_knots()))
+            bic = self._bic(len(xs), max(rmse ** 2, 1e-300), knots + 4)
+            cs = CubicSpline(xs, np.asarray(spline(xs), dtype=np.float64))
 
             def evaluate(x_eval: FloatArray) -> FloatArray:
                 return np.asarray(spline(x_eval), dtype=np.float64)
 
             return FittedModel(
-                name=f"Cubic spline ({k_count} knots)",
+                name="Cubic Spline",
                 evaluate=evaluate,
                 latex_kind="spline",
                 rmse=rmse,
-                aic=aic,
-                complexity=float(k_count) * 0.3,
-                params={"spline": spline, "knots": knots, "segments": k_count},
+                l_inf=l_inf,
+                bic=bic,
+                complexity=float(knots) * 0.3,
+                params={"cubic_spline": cs, "x_knots": xs.tolist(), "k_count": knots},
             )
         except (ValueError, TypeError):
-            spline_cs = CubicSpline(x_sorted, y_sorted)
-            y_pred = np.asarray(spline_cs(x_sorted), dtype=np.float64)
-            rmse = self._rmse(y_sorted, y_pred)
-
-            segments = max(1, len(x_sorted) - 1)
-            aic = self._aic(len(x_sorted), rmse * rmse, segments * 4)
+            cs = CubicSpline(xs, ys)
+            y_pred = np.asarray(cs(xs), dtype=np.float64)
+            rmse = self._rmse(ys, y_pred)
+            l_inf = self._l_inf(ys, y_pred)
+            segs = max(1, len(xs) - 1)
+            bic = self._bic(len(xs), max(rmse ** 2, 1e-300), segs * 4)
 
             def evaluate(x_eval: FloatArray) -> FloatArray:  # type: ignore[misc]
-                return np.asarray(spline_cs(x_eval), dtype=np.float64)
+                return np.asarray(cs(x_eval), dtype=np.float64)
 
             return FittedModel(
-                name=f"Cubic spline ({segments} segments)",
+                name="Cubic Spline",
                 evaluate=evaluate,
                 latex_kind="spline",
                 rmse=rmse,
-                aic=aic,
-                complexity=float(segments) * 0.3,
-                params={"spline": spline_cs, "segments": segments},
+                l_inf=l_inf,
+                bic=bic,
+                complexity=float(segs) * 0.3,
+                params={"cubic_spline": cs, "x_knots": xs.tolist(), "k_count": segs},
             )
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# AAA rational approximation
+# Replaces the hand-rolled Loewner/SVD loop with scipy.interpolate.AAA.
+# The SciPy implementation is the official reference implementation of the
+# Nakatsukasa-Sete-Trefethen (2018) algorithm.
+# ===========================================================================
+
+class AAAFitter(ModelFitter):
+
+    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
+        try:
+            if len(x) < 8:
+                return None
+
+            rtol: float = max(1e-13, float(accuracy) * 1e-3)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                r = AAA(x.tolist(), y.tolist(), rtol=rtol)
+
+            y_pred = np.asarray(r(x.tolist()), dtype=np.float64)
+            if not np.all(np.isfinite(y_pred)):
+                return None
+
+            rmse = self._rmse(y, y_pred)
+            l_inf = self._l_inf(y, y_pred)
+            n_terms: int = len(r.support_points)
+            bic = self._bic(len(x), max(rmse ** 2, 1e-300), n_terms * 2)
+
+            # Store lightweight scalars for LaTeX (not the AAA object itself).
+            sp_list = [float(v) for v in r.support_points]
+            sv_list = [float(v) for v in r.support_values]
+            w_list = [float(v) for v in r.weights]
+            aaa_obj = r
+
+            def evaluate(x_eval: FloatArray) -> FloatArray:
+                out = np.asarray(aaa_obj(x_eval), dtype=np.float64)
+                out[~np.isfinite(out)] = float("nan")
+                return out
+
+            return FittedModel(
+                name="AAA Algorithm",
+                evaluate=evaluate,
+                latex_kind="aaa",
+                rmse=rmse,
+                l_inf=l_inf,
+                bic=bic,
+                complexity=float(n_terms) * 0.8,
+                params={
+                    "support_points": sp_list,
+                    "support_values": sv_list,
+                    "weights": w_list,
+                    "n_terms": n_terms,
+                },
+            )
+        except (ValueError, TypeError, RuntimeError, np.linalg.LinAlgError, FloatingPointError):
+            return None
+
+
+# ===========================================================================
+# L-inf minimax polynomial via scipy.optimize.linprog
+# Uses Chebyshev Vandermonde (chebvander) instead of power-basis vander for
+# better LP conditioning.  method='highs' is the modern HiGHS backend.
+# ===========================================================================
+
+class LinfPolynomialFitter(ModelFitter):
+
+    def __init__(self, max_degree: int = 8) -> None:
+        self._max_degree = max_degree
+
+    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
+        if len(x) < 4:
+            return None
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        if x_max - x_min < 1e-12:
+            return None
+
+        # Normalise to [-1, 1] — same mapping Chebyshev.fit uses internally
+        mid = 0.5 * (x_max + x_min)
+        half = 0.5 * (x_max - x_min)
+        t = (x - mid) / half
+        y_scale = float(np.std(y)) or 1.0
+
+        best_score = float("inf")
+        best_degree = 2
+        best_coef: list[float] = [0.0, 0.0, 0.0]
+
+        for degree in range(2, min(self._max_degree, len(x) - 2) + 1):
+            try:
+                # chebvander: Chebyshev Vandermonde — far better conditioned than np.vander
+                V = np.polynomial.chebyshev.chebvander(t, degree)
+                n_pts, n_coef = V.shape
+                n_vars = n_coef + 1   # [c_0, ..., c_d, epsilon]
+
+                c_obj = np.zeros(n_vars, dtype=np.float64)
+                c_obj[-1] = 1.0
+
+                ones = np.ones((n_pts, 1), dtype=np.float64)
+                # Constraints: V*c - y <= eps  AND  y - V*c <= eps
+                A_ub = np.vstack([
+                    np.hstack([V, -ones]),
+                    np.hstack([-V, -ones]),
+                ])
+                b_ub = np.concatenate([y, -y])
+
+                result = linprog(
+                    c_obj,
+                    A_ub=A_ub,
+                    b_ub=b_ub,
+                    bounds=[(None, None)] * n_vars,
+                    method="highs",
+                )
+                if not result.success:
+                    continue
+
+                cheb_coef = np.asarray(result.x[:n_coef], dtype=np.float64)
+                y_pred = np.asarray(
+                    np.polynomial.chebyshev.chebval(t, cheb_coef), dtype=np.float64
+                )
+                if not np.all(np.isfinite(y_pred)):
+                    continue
+
+                rmse = self._rmse(y, y_pred)
+                l_inf = self._l_inf(y, y_pred)
+                score = ALPHA * l_inf / y_scale + BETA * rmse / y_scale + GAMMA * float(degree) * 0.5
+                if score < best_score:
+                    best_score = score
+                    best_degree = degree
+                    best_coef = [float(c) for c in cheb_coef]
+            except (ValueError, RuntimeError, TypeError):
+                continue
+
+        if best_score == float("inf"):
+            return None
+
+        p_mid, p_half, p_coef = mid, half, best_coef
+
+        def evaluate(x_eval: FloatArray) -> FloatArray:
+            t_e = (x_eval - p_mid) / p_half
+            return np.asarray(
+                np.polynomial.chebyshev.chebval(t_e, np.asarray(p_coef)), dtype=np.float64
+            )
+
+        y_f = evaluate(x)
+        rmse_f = self._rmse(y, y_f)
+        l_inf_f = self._l_inf(y, y_f)
+        bic_f = self._bic(len(x), max(rmse_f ** 2, 1e-300), best_degree + 1)
+
+        return FittedModel(
+            name="L-inf minimax polynomial",
+            evaluate=evaluate,
+            latex_kind="linf_poly",
+            rmse=rmse_f,
+            l_inf=l_inf_f,
+            bic=bic_f,
+            complexity=float(best_degree) * 0.6,
+            params={"cheb_coef": p_coef, "degree": best_degree,
+                    "x_mid": p_mid, "x_half": p_half},
+        )
+
+
+# ===========================================================================
+# Interpolation polynomial in Chebyshev basis
+# Uses barycentric Chebyshev nodes of the second kind (Chebyshev-Gauss-Lobatto)
+# for guaranteed stability: Chebyshev.fit with degree = n-1 through all points.
+# Distinct from the LS fitter, which minimises ||residual||₂ over degree ≤ 14.
+# ===========================================================================
+
+class InterpolationPolynomialFitter(ModelFitter):
+    """Interpolates ALL data points exactly using Chebyshev nodes of the 2nd kind.
+
+    The interpolant is built as a Chebyshev expansion on [x_min, x_max] via
+    numpy's Chebyshev.fit with deg = n - 1.  To control Runge's phenomenon the
+    fitter subsamples to at most MAX_PTS equidistant-by-arc-length points first,
+    choosing the subsampled count that minimises the leave-one-out RMSE.
+    """
+
+    _MAX_PTS: int = 32   # interpolation beyond this degree is unstable for most data
+
+    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
+        if len(x) < 4:
+            return None
+        x_min, x_max = float(np.min(x)), float(np.max(x))
+        if x_max - x_min < 1e-12:
+            return None
+
+        n_pts = min(len(x), self._MAX_PTS)
+        # Arc-length uniform subsample to n_pts points
+        idx = np.argsort(x)
+        xs, ys = x[idx], y[idx]
+
+        # Try several subsample counts; pick the one with smallest RMSE on full data
+        best_score = float("inf")
+        best_cheb: Optional[Chebyshev] = None
+        y_scale = float(np.std(y)) or 1.0
+
+        for n in range(4, n_pts + 1):
+            try:
+                # Chebyshev-Gauss-Lobatto nodes mapped to [x_min, x_max]
+                k = np.arange(n)
+                cgl = 0.5 * (x_min + x_max) + 0.5 * (x_max - x_min) * np.cos(
+                    np.pi * k / (n - 1)
+                )
+                # Interpolate y at CGL nodes using cubic spline through original data
+                cs_tmp = CubicSpline(xs, ys)
+                y_cgl = np.asarray(cs_tmp(np.sort(cgl)), dtype=np.float64)
+                cgl_s = np.sort(cgl)
+
+                cheb = Chebyshev.fit(cgl_s, y_cgl, n - 1, domain=[x_min, x_max])
+                y_pred = np.asarray(cheb(x), dtype=np.float64)
+                if not np.all(np.isfinite(y_pred)):
+                    continue
+                rmse = self._rmse(y, y_pred)
+                l_inf = self._l_inf(y, y_pred)
+                score = ALPHA * l_inf / y_scale + BETA * rmse / y_scale + GAMMA * float(n) * 0.6
+                if score < best_score:
+                    best_score, best_cheb = score, cheb
+            except (np.linalg.LinAlgError, ValueError, TypeError):
+                continue
+
+        if best_cheb is None:
+            return None
+
+        cheb_obj = best_cheb
+        deg = len(cheb_obj.coef) - 1
+        y_pred_f = np.asarray(cheb_obj(x), dtype=np.float64)
+        rmse_f = self._rmse(y, y_pred_f)
+        l_inf_f = self._l_inf(y, y_pred_f)
+        bic_f = self._bic(len(x), max(rmse_f ** 2, 1e-300), deg + 1)
+
+        def evaluate(x_eval: FloatArray) -> FloatArray:
+            return np.asarray(cheb_obj(x_eval), dtype=np.float64)
+
+        return FittedModel(
+            name="Interpolation polynomial (Chebyshev Basis)",
+            evaluate=evaluate,
+            latex_kind="chebyshev",
+            rmse=rmse_f,
+            l_inf=l_inf_f,
+            bic=bic_f,
+            complexity=float(deg) * 0.6,
+            params={
+                "cheb_coef": list(cheb_obj.coef),
+                "domain": [x_min, x_max],
+                "degree": deg,
+            },
+        )
+
+
+# ===========================================================================
+# Tangential fitter  A * tan(B*x + C) + D
+# Restricted so that no pole B*x+C = pi/2 + k*pi falls inside the data domain.
+# ===========================================================================
+
+class TangentialFitter(ModelFitter):
+    """Fits y = A * tan(B*x + C) + D.
+
+    The tangent function has period π and vertical asymptotes at
+    B*x + C = π/2 + k·π.  We avoid poles in the data range by constraining
+    B to (0, π/x_span) so at most one monotone branch fits the data, and
+    clipping the argument to (−π/2 + ε, π/2 − ε) for numerical safety.
+    """
+
+    _EPS: float = 0.05   # margin from ±π/2 for argument clipping
+
+    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
+        try:
+            validation = self._validate_basic_data(x, y, min_points=8)
+            if validation is None:
+                return None
+            n, y_std, x_span = validation
+
+            # Monotone increasing data is a prerequisite — quick heuristic
+            x_s = x[np.argsort(x)]
+            y_s = y[np.argsort(x)]
+            monotone_frac = float(np.mean(np.diff(y_s) > 0))
+            if 0.45 < monotone_frac < 0.55:
+                # Neither clearly monotone nor clearly not — try anyway
+                pass
+            if monotone_frac < 0.3 or monotone_frac > 0.7:
+                # Strongly non-monotone — tangent cannot fit well
+                if monotone_frac < 0.3:
+                    return None
+
+            eps = self._EPS
+
+            def _tan(xv: FloatArray, a: float, b: float, c: float, d: float) -> FloatArray:
+                arg = b * xv + c
+                # Soft-clamp to (-π/2+ε, π/2-ε): avoids overflow at poles
+                half_pi = 0.5 * np.pi
+                arg_clipped = np.clip(arg % np.pi - half_pi, -half_pi + eps, half_pi - eps)
+                return np.asarray(a * np.tan(arg_clipped) + d, dtype=np.float64)
+
+            best_rmse = float("inf")
+            best_popt: Optional[FloatArray] = None
+
+            b_lo = 0.05 / x_span
+            b_hi = 0.95 * np.pi / x_span    # keep < π/x_span so single branch
+
+            for b_seed in np.linspace(b_lo, b_hi, 5):
+                for c_seed in (0.0, 0.2, -0.2, 0.5 * np.pi * b_seed * float(np.mean(x))):
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            res = curve_fit(
+                                _tan, x_s, y_s,
+                                p0=[y_std, b_seed, c_seed, float(np.mean(y_s))],
+                                maxfev=15000,
+                                bounds=(
+                                    [-np.inf, b_lo, -np.pi / 2, -np.inf],
+                                    [np.inf,  b_hi,  np.pi / 2,  np.inf],
+                                ),
+                            )
+                        popt = np.asarray(res[0], dtype=np.float64)
+                        yp = _tan(x_s, *popt)
+                        if not np.all(np.isfinite(yp)):
+                            continue
+                        r = self._rmse(y_s, yp)
+                        if r < best_rmse:
+                            best_rmse, best_popt = r, popt
+                    except (RuntimeError, ValueError):
+                        continue
+
+            if best_popt is None:
+                return None
+
+            ta, tb, tc, td = (float(best_popt[k]) for k in range(4))
+            y_pred = _tan(x_s, ta, tb, tc, td)
+
+            if not self._validate_fitted_result(y_s, y_pred, y_std):
+                return None
+
+            rmse = self._rmse(y_s, y_pred)
+            l_inf = self._l_inf(y_s, y_pred)
+            bic = self._bic(n, max(rmse ** 2, 1e-300), 4)
+
+            tan_a, tan_b, tan_c, tan_d = ta, tb, tc, td
+
+            def evaluate(x_eval: FloatArray) -> FloatArray:
+                return _tan(x_eval, tan_a, tan_b, tan_c, tan_d)
+
+            return FittedModel(
+                name="Tangential curve",
+                evaluate=evaluate,
+                latex_kind="tangential",
+                rmse=rmse,
+                l_inf=l_inf,
+                bic=bic,
+                complexity=4.0,
+                params={"A": tan_a, "B": tan_b, "C": tan_c, "D": tan_d},
+            )
+        except (RuntimeError, ValueError, TypeError, OverflowError,
+                np.linalg.LinAlgError, FloatingPointError):
+            return None
+
+
+# ===========================================================================
+# NUFFT — Non-Uniform Fast Fourier Transform fitter
+# Implements Type-1 NUFFT via least-squares trigonometric regression:
+#   f(x) = a₀/2 + Σₖ [aₖ cos(k·θ) + bₖ sin(k·θ)],  θ = 2π(x−x₀)/span
+# This is the pseudoinverse of the NUFFT forward operator and equivalent to
+# the output of a finufft.nufft1d1 solve with adjoint normalisation.
+# Tikhonov regularisation (λ = 10⁻⁶·n) prevents overfitting to noise.
+# ===========================================================================
+
+class NUFFTFitter(ModelFitter):
+    """Trigonometric least-squares approximation on non-uniform samples.
+
+    The reconstruction is a real-valued trigonometric polynomial of order N*:
+
+        f(x) = a₀/2 + Σ_{k=1}^{N*} [aₖ cos(k θ) + bₖ sin(k θ)]
+
+    where θ = 2π(x − x_min)/span ∈ [0, 2π).
+
+    N* is chosen by minimising the penalised score over N ∈ {2, …, N_max};
+    the system is solved via normal equations with Tikhonov regularisation.
+    """
+
+    _N_MAX: int = 24   # maximum Fourier order to search
+
+    def fit(self, x: FloatArray, y: FloatArray, accuracy: float) -> Optional[FittedModel]:
+        try:
+            n = len(x)
+            if n < 8:
+                return None
+            x0 = float(np.min(x))
+            span = float(np.max(x) - x0)
+            if span < 1e-12:
+                return None
+
+            theta = (2.0 * np.pi / span) * (x - x0)   # ∈ [0, 2π)
+            y_scale = float(np.std(y)) or 1.0
+            lam = 1e-6 * n   # Tikhonov regularisation weight
+
+            best_score = float("inf")
+            best_N = 2
+            best_coeffs: Optional[FloatArray] = None
+
+            n_max = min(self._N_MAX, (n - 1) // 2)
+
+            for N in range(2, n_max + 1):
+                try:
+                    A = self._vander(theta, N)        # n × (2N+1)
+                    ATA = A.T @ A
+                    ATA[np.diag_indices_from(ATA)] += lam
+                    coeffs = np.linalg.solve(ATA, A.T @ y)
+                    y_pred = A @ coeffs
+                    if not np.all(np.isfinite(y_pred)):
+                        continue
+                    rmse = self._rmse(y, y_pred)
+                    l_inf = self._l_inf(y, y_pred)
+                    complexity = float(N) * 0.4
+                    score = (ALPHA * l_inf / y_scale + BETA * rmse / y_scale
+                             + GAMMA * complexity)
+                    if score < best_score:
+                        best_score, best_N, best_coeffs = score, N, coeffs
+                    # Early stop if residual < requested accuracy
+                    if rmse < max(1e-9, float(accuracy)):
+                        break
+                except np.linalg.LinAlgError:
+                    continue
+
+            if best_coeffs is None:
+                return None
+
+            c = best_coeffs
+            N_fit = best_N
+            x0_fit = x0
+            span_fit = span
+
+            def evaluate(x_eval: FloatArray) -> FloatArray:
+                th = (2.0 * np.pi / span_fit) * (x_eval - x0_fit)
+                A_eval = NUFFTFitter._vander(th, N_fit)
+                return np.asarray(A_eval @ c, dtype=np.float64)
+
+            y_f = evaluate(x)
+            rmse_f = self._rmse(y, y_f)
+            l_inf_f = self._l_inf(y, y_f)
+            bic_f = self._bic(n, max(rmse_f ** 2, 1e-300), 2 * N_fit + 1)
+
+            return FittedModel(
+                name="Non-Uniform Fast Fourier Transform (NUFFT)",
+                evaluate=evaluate,
+                latex_kind="nufft",
+                rmse=rmse_f,
+                l_inf=l_inf_f,
+                bic=bic_f,
+                complexity=float(N_fit) * 0.4,
+                params={
+                    "coeffs": c.tolist(),
+                    "N": N_fit,
+                    "x0": x0_fit,
+                    "span": span_fit,
+                },
+            )
+        except (RuntimeError, ValueError, TypeError, OverflowError,
+                np.linalg.LinAlgError, FloatingPointError):
+            return None
+
+    @staticmethod
+    def _vander(theta: FloatArray, n: int) -> FloatArray:
+        """Build real trigonometric Vandermonde matrix of order n.
+
+        Returns A of shape (len(theta), 2n+1) where columns are:
+        [1, cos θ, sin θ, cos 2θ, sin 2θ, …, cos nθ, sin nθ].
+        """
+        cols = [np.ones(len(theta), dtype=np.float64)]
+        for k in range(1, n + 1):
+            cols.append(np.cos(k * theta))
+            cols.append(np.sin(k * theta))
+        return np.column_stack(cols)
+
+
+# ===========================================================================
 # Model selection service
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 class ModelSelectionService:
+    """Runs all 12 canonical fitters and exposes a fixed-order registry.
+
+    The registry defines the canonical display order and names that the UI
+    always shows, regardless of which fitters converged on a given input.
+    """
+
+    # Canonical display order — names must match exactly what each fitter returns.
+    CANONICAL_NAMES: tuple[str, ...] = (
+        "Cubic Spline",
+        "Interpolation polynomial (Chebyshev Basis)",
+        "L-inf minimax polynomial",
+        "Polynomial Least Squares Approximation (Chebyshev Basis)",
+        "Non-Uniform Fast Fourier Transform (NUFFT)",
+        "AAA Algorithm",
+        "Exponential curve",
+        "Logarithmic curve",
+        "Rational curve",
+        "Sinusoidal curve",
+        "Tangential curve",
+        "Arctan (S-curve)",
+    )
+
     def __init__(self) -> None:
         self._fitters: tuple[ModelFitter, ...] = (
-            PolynomialFitter(),
-            SinusoidalFitter(),
+            SplineFitter(),
+            InterpolationPolynomialFitter(),
+            LinfPolynomialFitter(),
+            ChebyshevPolynomialFitter(),
+            NUFFTFitter(),
+            AAAFitter(),
             ExponentialFitter(),
             LogarithmicFitter(),
-            SplineFitter(),
+            RationalFitter(),
+            SinusoidalFitter(),
+            TangentialFitter(),
+            ArctanFitter(),
         )
 
-    def fit_all_models(self, x: FloatArray, y: FloatArray, accuracy: float) -> list[FittedModel]:
-        models: list[FittedModel] = []
+    def fit_all_models(self, x: FloatArray, y: FloatArray,
+                       accuracy: float) -> list[Optional[FittedModel]]:
+        """Return one slot per canonical model (None if fitter did not converge)."""
+        results: list[Optional[FittedModel]] = []
         for fitter in self._fitters:
             try:
-                model = fitter.fit(x, y, accuracy)
-                if model is not None:
-                    models.append(model)
-            except (RuntimeError, ValueError, TypeError, OverflowError, FloatingPointError):
-                continue
-        return models
+                results.append(fitter.fit(x, y, accuracy))
+            except (RuntimeError, ValueError, TypeError, OverflowError,
+                    np.linalg.LinAlgError, FloatingPointError):
+                results.append(None)
+        return results
 
     @staticmethod
-    def select_best_model(models: list[FittedModel], y: FloatArray) -> FittedModel:
-        if not models:
-            raise ValueError("No models to select from")
-
-        y_std = float(np.std(y))
-
-        def score(m: FittedModel) -> float:
-            normalized_rmse = m.rmse / y_std if y_std > 0 else m.rmse
-            return float(normalized_rmse + 0.1 * m.aic + m.complexity)
-
-        scores = np.asarray([score(m) for m in models], dtype=np.float64)
-        best_idx = int(np.argmin(scores))
-
-        if len(models) > 1:
-            sorted_indices = np.argsort(scores)
-            second_idx = int(sorted_indices[1])
-            best_score = float(scores[best_idx])
-            second_score = float(scores[second_idx])
-            if best_score > 0 and abs(best_score - second_score) < 0.05 * best_score:
-                if models[best_idx].complexity > models[second_idx].complexity:
-                    return models[second_idx]
-
-        return models[best_idx]
+    def select_best_model(
+        models: list[Optional[FittedModel]], y: FloatArray
+    ) -> Optional[FittedModel]:
+        y_scale = float(np.std(y)) or 1.0
+        fitted = [m for m in models if m is not None]
+        if not fitted:
+            return None
+        return min(fitted, key=lambda m: m.score(y_scale))
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # LaTeX generator
-# ---------------------------------------------------------------------------
+# dispatch dict is an instance attribute, built once in __init__
+# ===========================================================================
 
 class LaTeXGenerator:
+    """Converts FittedModel -> display-math LaTeX string.
+
+    Parameters
+    ----------
+    approx : bool
+        When True (default) all numeric coefficients are rendered as
+        rounded decimals with *decimals* digits after the point.
+        When False, exact rational fractions are used.
+    decimals : int
+        Number of digits after the decimal point in approximate mode.
+    """
+
+    _MAX_SPLINE_CASES: int = 6
+
+    def __init__(self, approx: bool = True, decimals: int = 3) -> None:
+        self.approx = approx
+        self.decimals = max(0, min(10, int(decimals)))
+        # Built once at construction, not on every generate() call
+        self._dispatch: dict[str, Callable[[FittedModel], str]] = {
+            "chebyshev":   self._chebyshev,
+            "sinusoidal":  self._sinusoidal,
+            "exponential": self._exponential,
+            "logarithmic": self._logarithmic,
+            "rational":    self._rational,
+            "arctan":      self._arctan,
+            "tangential":  self._tangential,
+            "spline":      self._spline,
+            "aaa":         self._aaa,
+            "linf_poly":   self._linf_poly,
+            "nufft":       self._nufft,
+        }
+
+    def reconfigure(self, approx: bool, decimals: int) -> None:
+        """Update mode without rebuilding the dispatch table."""
+        self.approx = approx
+        self.decimals = max(0, min(10, int(decimals)))
+
     def generate(self, model: FittedModel) -> str:
         try:
-            if model.latex_kind == "polynomial":
-                return self._polynomial(model)
-            if model.latex_kind == "sinusoidal":
-                return self._sinusoidal(model)
-            if model.latex_kind == "exponential":
-                return self._exponential(model)
-            if model.latex_kind == "logarithmic":
-                return self._logarithmic(model)
-            if model.latex_kind == "spline":
-                return self._spline(model)
-            return r"$f(x) = \text{unknown}$"
-        except (ValueError, TypeError, AttributeError):
-            return r"$f(x) = \text{error}$"
+            handler = self._dispatch.get(model.latex_kind)
+            return handler(model) if handler is not None else self._fallback(model)
+        except (KeyError, TypeError, AttributeError, ValueError, ArithmeticError):
+            return self._fallback(model)
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _n(self, v: float) -> sp.Expr:
+        """Convert float to sympy number respecting approx mode.
+
+        Approx mode  → sp.Float with string representation at self.decimals places.
+        Exact mode   → sp.Rational with denominator ≤ 1000 (exact fraction).
+        """
+        if self.approx:
+            return sp.Float(f"{v:.{self.decimals}f}")
+        return sp.Rational(v).limit_denominator(1000)
+
+    def _round_floats(self, expr: sp.Basic) -> sp.Basic:
+        """Walk *expr* and round every sp.Float leaf to self.decimals decimal places.
+
+        This is needed because symbolic arithmetic (e.g. inside Chebyshev
+        recurrences) can produce floats with more digits than the user requested,
+        even when the inputs were already rounded.
+        """
+        if isinstance(expr, sp.Float):
+            return sp.Float(f"{float(expr):.{self.decimals}f}")
+        if expr.args:
+            return expr.func(*[self._round_floats(a) for a in expr.args])
+        return expr
+
+    # Keep _r as a static alias for exact-only contexts (spline knot labels, etc.)
     @staticmethod
-    def _wrap(expr: sp.Basic) -> str:
-        simplified = sp.simplify(expr)
-        return f"$f(x) = {sp.latex(simplified)}$"
+    def _r(v: float, denom: int = 1000) -> sp.Rational:
+        return sp.Rational(v).limit_denominator(denom)
 
-    def _polynomial(self, model: FittedModel) -> str:
-        raw_coeffs = model.params["coeffs"]
-        degree = int(model.params["degree"])
-        # Accept either a list[float] (new) or ndarray (legacy)
-        coeffs: list[float] = (
-            [float(c) for c in raw_coeffs]
-            if hasattr(raw_coeffs, "__iter__")
-            else [float(raw_coeffs)]
-        )
+    def _wrap(self, expr: sp.Basic) -> str:
+        """Simplify *expr* and format as display-math LaTeX.
+
+        Approx mode: walk the tree and round all Float leaves to self.decimals
+        before calling sp.latex — this fixes both digit count and Chebyshev
+        recurrence artifacts.
+        Exact mode: nsimplify cleans up rational arithmetic.
+        """
+        if self.approx:
+            return f"$$f(x) = {sp.latex(self._round_floats(expr))}$$"
+        simplified = sp.nsimplify(expr, rational=False, tolerance=1e-6)
+        return f"$$f(x) = {sp.latex(simplified)}$$"
+
+    def _expand_cheb_series(self, coef: list[float], t: sp.Expr) -> str:
+        """Build sum of c_k * T_k(t) symbolically and wrap in display-math."""
+        expr: sp.Expr = sp.Integer(0)
+        for k, c in enumerate(coef):
+            if abs(c) < 1e-14:
+                continue
+            expr += self._n(c) * sp.chebyshevt(k, t)  # type: ignore[attr-defined]
+        return self._wrap(sp.expand(expr))
+
+    # ------------------------------------------------------------------
+    # Per-kind generators
+    # ------------------------------------------------------------------
+
+    def _chebyshev(self, model: FittedModel) -> str:
+        """Expand Chebyshev series symbolically using stored .coef array."""
+        cheb_coef: list[float] = list(model.params["cheb_coef"])
+        x_min = float(model.params["domain"][0])
+        x_max = float(model.params["domain"][1])
 
         x = sp.Symbol("x")
-        terms: list[sp.Basic] = []
-        for i, c in enumerate(coeffs):
-            exp = degree - i
-            coef = sp.Rational(c).limit_denominator(10000)
-            terms.append(coef * x ** exp)
-        return self._wrap(sp.Add(*terms))
+        mid_val = 0.5 * (x_max + x_min)
+        half_val = 0.5 * (x_max - x_min)
+        # Use Float in approx mode: Rational mid/half propagate into Chebyshev
+        # recurrence and produce many-digit fractional coefficients.
+        if self.approx:
+            t = (x - sp.Float(mid_val)) / sp.Float(half_val)
+        else:
+            t = (x - sp.Rational(mid_val).limit_denominator(10000)) / sp.Rational(half_val).limit_denominator(10000)
+        return self._expand_cheb_series(cheb_coef, t)
 
     def _sinusoidal(self, model: FittedModel) -> str:
-        a_val = float(model.params["A"])
-        f_val = float(model.params["f"])
-        phase = float(model.params["phase"])
-        b_val = float(model.params["B"])
-
         x = sp.Symbol("x")
-        a = sp.Rational(a_val).limit_denominator(10000)
-        f = sp.Rational(f_val).limit_denominator(10000)
-        ph = sp.Rational(phase).limit_denominator(10000)
-        b = sp.Rational(b_val).limit_denominator(10000)
-
-        expr = a * sp.sin(2 * sp.pi * f * x + ph) + b
-        return self._wrap(expr)
+        A = self._n(float(model.params["A"]))
+        f = self._n(float(model.params["f"]))
+        ph = self._n(float(model.params["phase"]))
+        B = self._n(float(model.params["B"]))
+        return self._wrap(A * sp.sin(sp.Integer(2) * sp.pi * f * x + ph) + B)
 
     def _exponential(self, model: FittedModel) -> str:
-        a_val = float(model.params["A"])
-        b_val = float(model.params["B"])
-        c_val = float(model.params["C"])
-
         x = sp.Symbol("x")
-        a = sp.Rational(a_val).limit_denominator(10000)
-        b = sp.Rational(b_val).limit_denominator(10000)
-        c = sp.Rational(c_val).limit_denominator(10000)
-
-        expr = a * sp.exp(b * x) + c
-        return self._wrap(expr)
+        A = self._n(float(model.params["A"]))
+        B = self._n(float(model.params["B"]))
+        C = self._n(float(model.params["C"]))
+        return self._wrap(A * sp.exp(B * x) + C)
 
     def _logarithmic(self, model: FittedModel) -> str:
-        a_val = float(model.params["A"])
-        b_val = float(model.params["B"])
+        x = sp.Symbol("x")
+        A = self._n(float(model.params["A"]))
+        B = self._n(float(model.params["B"]))
+        shift = float(model.params.get("shift", 0.0))
+        arg = x + self._n(shift) if abs(shift) > 1e-9 else x
+        return self._wrap(A * sp.ln(arg) + B)
+
+    def _rational(self, model: FittedModel) -> str:
+        x = sp.Symbol("x")
+        A = self._n(float(model.params["A"]))
+        B = self._n(float(model.params["B"]))
+        D = self._n(float(model.params["D"]))
+        return self._wrap(A + B / (x - D))
+
+    def _arctan(self, model: FittedModel) -> str:
+        x = sp.Symbol("x")
+        A = self._n(float(model.params["A"]))
+        B = self._n(float(model.params["B"]))
+        C = self._n(float(model.params["C"]))
+        D = self._n(float(model.params["D"]))
+        latex_str = self._wrap(A * sp.atan(B * x + C) + D)
+        # Fix: sympy renders atan as \operatorname{atan}, we want \arctan
+        return latex_str.replace(r'\operatorname{atan}', r'\arctan')
+
+    @staticmethod
+    def _spline_poly(n0: sp.Expr, n1: sp.Expr, n2: sp.Expr, n3: sp.Expr,
+                     dx: sp.Expr) -> sp.Expr:
+        """Expand cubic polynomial c0*dx³ + c1*dx² + c2*dx + c3 in x."""
+        return sp.expand(n0 * dx ** 3 + n1 * dx ** 2 + n2 * dx + n3)
+
+    def _spline(self, model: FittedModel) -> str:
+        cs: Optional[CubicSpline] = model.params.get("cubic_spline")
+        x_knots_raw: list[float] = model.params.get("x_knots", [])
+
+        if cs is None or len(x_knots_raw) < 2:
+            k = model.params.get("k_count", "?")
+            return rf"$$f(x) = \text{{Cubic spline ({k} segments)}}$$"
+
+        x_knots = np.asarray(x_knots_raw, dtype=np.float64)
+        if len(x_knots) > self._MAX_SPLINE_CASES + 1:
+            sel = np.linspace(0, len(x_knots) - 1, self._MAX_SPLINE_CASES + 1, dtype=int)
+            x_knots = x_knots[sel]
+
+        x_sym = sp.Symbol("x")
+        cases: list[str] = []
+
+        for i in range(len(x_knots) - 1):
+            xi, xi1 = float(x_knots[i]), float(x_knots[i + 1])
+            seg = int(np.searchsorted(cs.x, 0.5 * (xi + xi1), side="right") - 1)
+            seg = max(0, min(seg, cs.c.shape[1] - 1))
+
+            c0 = float(cs.c[0, seg])
+            c1 = float(cs.c[1, seg])
+            c2 = float(cs.c[2, seg])
+            c3 = float(cs.c[3, seg])
+
+            if self.approx:
+                dx: sp.Expr = x_sym - sp.Float(xi)
+                piece_out = self._round_floats(
+                    self._spline_poly(self._n(c0), self._n(c1), self._n(c2), self._n(c3), dx)
+                )
+                lo: str = f"{xi:.{self.decimals}f}"
+                hi: str = f"{xi1:.{self.decimals}f}"
+            else:
+                dx = x_sym - sp.Rational(xi).limit_denominator(1000)
+                piece_out = self._spline_poly(
+                    self._n(c0), self._n(c1), self._n(c2), self._n(c3), dx
+                )
+                lo = sp.latex(sp.Rational(xi).limit_denominator(100))
+                hi = sp.latex(sp.Rational(xi1).limit_denominator(100))
+
+            cases.append(rf"{sp.latex(piece_out)}, & {lo} \le x < {hi}")
+
+        body = r" \\ ".join(cases)
+        return rf"$$f(x) = \begin{{cases}} {body} \end{{cases}}$$"
+
+    def _aaa(self, model: FittedModel) -> str:
+        """Barycentric form using support_points, support_values and weights from AAA."""
+        sp_list: list[float] = list(model.params.get("support_points", []))
+        sv_list: list[float] = list(model.params.get("support_values", []))
+        w_list: list[float] = list(model.params.get("weights", []))
+
+        if not sp_list or len(sp_list) != len(sv_list) or len(sp_list) != len(w_list):
+            return self._fallback(model)
 
         x = sp.Symbol("x")
-        a = sp.Rational(a_val).limit_denominator(10000)
-        b = sp.Rational(b_val).limit_denominator(10000)
+        max_terms = min(8, len(sp_list))
+        num_expr: sp.Expr = sp.Integer(0)
+        den_expr: sp.Expr = sp.Integer(0)
 
-        expr = a * sp.ln(x) + b
+        for j in range(max_terms):
+            wj = self._n(w_list[j])
+            fj = self._n(sv_list[j])
+            zj = self._n(sp_list[j])
+            pole = x - zj
+            num_expr += wj * fj / pole
+            den_expr += wj / pole
+
+        if self.approx:
+            # sp.cancel on Float expressions produces garbage; render barycentric
+            # form directly after rounding all float leaves
+            num_r = self._round_floats(num_expr)
+            den_r = self._round_floats(den_expr)
+            body = rf"\frac{{{sp.latex(num_r)}}}{{{sp.latex(den_r)}}}"
+        else:
+            try:
+                ratio = sp.cancel(num_expr / den_expr)
+                body = sp.latex(ratio)
+            except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+                body = rf"\frac{{{sp.latex(num_expr)}}}{{{sp.latex(den_expr)}}}"
+
+        trail = r" + \ldots" if len(sp_list) > max_terms else ""
+        return f"$$f(x) = {body}{trail}$$"
+
+    def _linf_poly(self, model: FittedModel) -> str:
+        """Expand the L-inf Chebyshev-basis result into a standard poly in x."""
+        cheb_coef: list[float] = list(model.params["cheb_coef"])
+        x_mid = float(model.params["x_mid"])
+        x_half = float(model.params["x_half"])
+
+        x = sp.Symbol("x")
+        if self.approx:
+            t = (x - sp.Float(x_mid)) / sp.Float(x_half)
+        else:
+            t = (x - sp.Rational(x_mid).limit_denominator(1000)) / sp.Rational(x_half).limit_denominator(1000)
+        return self._expand_cheb_series(cheb_coef, t)
+
+    def _tangential(self, model: FittedModel) -> str:
+        x = sp.Symbol("x")
+        A = self._n(float(model.params["A"]))
+        B = self._n(float(model.params["B"]))
+        C = self._n(float(model.params["C"]))
+        D = self._n(float(model.params["D"]))
+        return self._wrap(A * sp.tan(B * x + C) + D)
+
+    def _nufft(self, model: FittedModel) -> str:
+        """Render the trigonometric polynomial as a truncated Fourier series."""
+        coeffs: list[float] = list(model.params.get("coeffs", []))
+        N: int = int(model.params.get("N", 0))
+        x0: float = float(model.params.get("x0", 0.0))
+        span: float = float(model.params.get("span", 1.0))
+        if not coeffs or N < 1:
+            return self._fallback(model)
+
+        x = sp.Symbol("x")
+        # θ = 2π(x − x₀)/span
+        if self.approx:
+            x0_s: sp.Expr = sp.Float(f"{x0:.{self.decimals}f}")
+            span_s: sp.Expr = sp.Float(f"{span:.{self.decimals}f}")
+        else:
+            x0_s = sp.Rational(x0).limit_denominator(1000)
+            span_s = sp.Rational(span).limit_denominator(1000)
+
+        theta = sp.Integer(2) * sp.pi * (x - x0_s) / span_s
+
+        expr: sp.Expr = self._n(coeffs[0]) / sp.Integer(2)   # a₀/2 constant term
+        for k in range(1, N + 1):
+            ak = coeffs[2 * k - 1] if 2 * k - 1 < len(coeffs) else 0.0
+            bk = coeffs[2 * k] if 2 * k < len(coeffs) else 0.0
+            if abs(ak) > 1e-14:
+                expr += self._n(ak) * sp.cos(sp.Integer(k) * theta)
+            if abs(bk) > 1e-14:
+                expr += self._n(bk) * sp.sin(sp.Integer(k) * theta)
+
         return self._wrap(expr)
 
     @staticmethod
-    def _spline(model: FittedModel) -> str:
-        segments = model.params.get("segments", "unknown")
-        return rf"$f(x) = \text{{Cubic spline with {segments} segments}}$"
+    def _fallback(model: FittedModel) -> str:
+        return (
+            rf"$$f(x) \approx \text{{{model.name}}}"
+            rf"\quad[\text{{RMSE}} = {model.rmse:.4g}]$$"
+        )
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Stroke preprocessor
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 class StrokePreprocessor:
+
     def __init__(self, domain_width: float, domain_height: float) -> None:
         if domain_width <= 0 or domain_height <= 0:
             raise ValueError("Domain dimensions must be positive")
@@ -619,157 +1574,169 @@ class StrokePreprocessor:
         self._domain_height = float(domain_height)
 
     def preprocess(self, x: FloatArray, y: FloatArray) -> tuple[FloatArray, FloatArray]:
-        n_samples = max(100, int(self._domain_width * 50))
-        x_res, y_res = self._resample_by_arc_length(x, y, n_samples)
-        x_smooth, y_smooth = self._smooth_curve(x_res, y_res)
-        x_clean, y_clean = self._remove_outliers(x_smooth, y_smooth)
-        if len(x_clean) > 50:
-            x_clean, y_clean = self._simplify_curve(x_clean, y_clean)
-        return x_clean, y_clean
+        n = max(100, int(self._domain_width * 50))
+        x, y = self._resample(x, y, n)
+        x, y = self._smooth(x, y)
+        x, y = self._remove_outliers(x, y)
+        if len(x) > 50:
+            x, y = self._simplify(x, y)
+        return x, y
 
     def is_function(self, x: FloatArray, y: FloatArray) -> tuple[bool, str]:
-        epsilon = self._domain_width / 1000.0
-        sorted_indices = np.argsort(x)
-        x_sorted: FloatArray = x[sorted_indices]
-        y_sorted: FloatArray = y[sorted_indices]
-
+        eps = self._domain_width / 1000.0
+        idx = np.argsort(x)
+        xs, ys = x[idx], y[idx]
         j = 0
-        for i in range(len(x_sorted)):
+        for i in range(len(xs)):
             if j < i:
                 j = i
-            while j + 1 < len(x_sorted) and x_sorted[j + 1] - x_sorted[i] <= epsilon:
+            while j + 1 < len(xs) and xs[j + 1] - xs[i] <= eps:
                 j += 1
             if j > i:
-                y_window = y_sorted[i:j + 1]
-                if float(np.max(y_window) - np.min(y_window)) > epsilon:
-                    return False, f"Multiple y-values at x ≈ {float(x_sorted[i]):.2f}"
+                win = ys[i: j + 1]
+                if float(np.ptp(win)) > eps:
+                    return False, f"Multiple y-values at x ~ {float(xs[i]):.2f}"
         return True, ""
 
     @staticmethod
-    def _resample_by_arc_length(
-        x: FloatArray, y: FloatArray, n_samples: int
-    ) -> tuple[FloatArray, FloatArray]:
+    def _resample(x: FloatArray, y: FloatArray, n: int) -> tuple[FloatArray, FloatArray]:
+        """Arc-length uniform resampling using make_interp_spline (k=1 = piecewise linear)."""
         if len(x) < 2:
             return x, y
-
-        dx = np.diff(x)
-        dy = np.diff(y)
+        dx, dy = np.diff(x), np.diff(y)
         s: FloatArray = np.concatenate(([0.0], np.cumsum(np.sqrt(dx * dx + dy * dy))))
         if float(s[-1]) == 0.0:
             return x, y
-
-        s_uniform = np.linspace(0.0, float(s[-1]), int(n_samples))
-
+        su = np.linspace(0.0, float(s[-1]), n)
         try:
-            f_x = interp1d(s, x, kind="linear", fill_value="extrapolate")
-            f_y = interp1d(s, y, kind="linear", fill_value="extrapolate")
+            spl_x = make_interp_spline(s, x, k=1)
+            spl_y = make_interp_spline(s, y, k=1)
             return (
-                np.asarray(f_x(s_uniform), dtype=np.float64),
-                np.asarray(f_y(s_uniform), dtype=np.float64),
+                np.asarray(spl_x(su), dtype=np.float64),
+                np.asarray(spl_y(su), dtype=np.float64),
             )
         except (ValueError, IndexError):
             return x, y
 
     @staticmethod
-    def _smooth_curve(x: FloatArray, y: FloatArray) -> tuple[FloatArray, FloatArray]:
+    def _smooth(x: FloatArray, y: FloatArray) -> tuple[FloatArray, FloatArray]:
+        """Savitzky-Golay smoothing via scipy.signal.savgol_filter."""
         if len(x) < 15:
             return x, y
-
-        window = len(x) if len(x) % 2 == 1 else len(x) - 1
-        window = min(15, window)
+        window = min(15, len(x) if len(x) % 2 == 1 else len(x) - 1)
         if window < 3:
             return x, y
-
         try:
-            poly_order = min(3, window - 1)
-            y_smooth = savgol_filter(y, window, poly_order)
-            return x, np.asarray(y_smooth, dtype=np.float64)
+            return x, np.asarray(savgol_filter(y, window, min(3, window - 1)), dtype=np.float64)
         except (ValueError, TypeError):
             return x, y
 
     @staticmethod
     def _remove_outliers(x: FloatArray, y: FloatArray) -> tuple[FloatArray, FloatArray]:
+        """Curvature-based outlier removal; scalar 2-D cross product (NumPy 2.0 safe)."""
         if len(x) < 5:
             return x, y
-
-        curvatures = np.zeros(len(x), dtype=np.float64)
+        curv = np.zeros(len(x), dtype=np.float64)
         radius = max(2, int(len(x) * 0.02))
-
         for i in range(len(x)):
-            i_prev = max(0, i - radius)
-            i_next = min(len(x) - 1, i + radius)
-            if i_next - i_prev < 2:
+            ip = max(0, i - radius)
+            iq = min(len(x) - 1, i + radius)
+            if iq - ip < 2:
                 continue
-
-            pts = np.array(
-                [[x[i_prev], y[i_prev]], [x[i], y[i]], [x[i_next], y[i_next]]],
-                dtype=np.float64,
-            )
-            a = float(np.linalg.norm(pts[1] - pts[0]))
-            b = float(np.linalg.norm(pts[2] - pts[1]))
-            c = float(np.linalg.norm(pts[2] - pts[0]))
-            denominator = a * b * c
-            if denominator <= 1e-10:
+            v1 = np.array([x[i] - x[ip], y[i] - y[ip]], dtype=np.float64)
+            v2 = np.array([x[iq] - x[ip], y[iq] - y[ip]], dtype=np.float64)
+            a = float(np.linalg.norm(v1))
+            b = float(np.linalg.norm(
+                np.array([x[iq] - x[i], y[iq] - y[i]], dtype=np.float64)
+            ))
+            c = float(np.linalg.norm(v2))
+            denom = a * b * c
+            if denom <= 1e-10:
                 continue
+            # Scalar z-component of 3-D cross product of two 2-D vectors
+            cross_z = float(v1[0] * v2[1] - v1[1] * v2[0])
+            curv[i] = 4.0 * abs(cross_z) / (2.0 * denom)
+        threshold = float(np.median(curv) + 3.0 * np.std(curv))
+        return x[curv < threshold], y[curv < threshold]
 
-            area = 0.5 * abs(float(np.cross(pts[1] - pts[0], pts[2] - pts[0])))
-            curvatures[i] = 4.0 * area / denominator
-
-        threshold = float(np.median(curvatures) + 3.0 * np.std(curvatures))
-        mask = curvatures < threshold
-        return x[mask], y[mask]
-
-    def _simplify_curve(self, x: FloatArray, y: FloatArray) -> tuple[FloatArray, FloatArray]:
-        points = np.column_stack((x, y))
-        tolerance = 0.01 * self._domain_height
-        simplified = self._simplify_line(points, float(tolerance))
+    def _simplify(self, x: FloatArray, y: FloatArray) -> tuple[FloatArray, FloatArray]:
+        pts = np.column_stack((x, y))
+        simplified = self._rdp(pts, 0.01 * self._domain_height)
         return simplified[:, 0], simplified[:, 1]
 
-    def _simplify_line(self, points: FloatArray, tolerance: float) -> FloatArray:
-        if len(points) < 3:
-            return points
-
-        max_distance = 0.0
-        split_index = 0
-        for i in range(1, len(points) - 1):
-            dist = self._perpendicular_distance(points[i], points[0], points[-1])
-            if dist > max_distance:
-                split_index = i
-                max_distance = dist
-
-        if max_distance > tolerance:
-            first = self._simplify_line(points[: split_index + 1], tolerance)
-            second = self._simplify_line(points[split_index:], tolerance)
-            return np.vstack((first[:-1], second))
-
-        return np.array([points[0], points[-1]], dtype=np.float64)
+    def _rdp(self, pts: FloatArray, tol: float) -> FloatArray:
+        """Ramer-Douglas-Peucker polyline simplification."""
+        if len(pts) < 3:
+            return pts
+        dmax, split = 0.0, 0
+        for i in range(1, len(pts) - 1):
+            d = self._perp(pts[i], pts[0], pts[-1])
+            if d > dmax:
+                split, dmax = i, d
+        if dmax > tol:
+            a = self._rdp(pts[: split + 1], tol)
+            b = self._rdp(pts[split:], tol)
+            return np.vstack((a[:-1], b))
+        return np.array([pts[0], pts[-1]], dtype=np.float64)
 
     @staticmethod
-    def _perpendicular_distance(
-        point: FloatArray, line_start: FloatArray, line_end: FloatArray
-    ) -> float:
-        if np.allclose(line_start, line_end):
-            return float(np.linalg.norm(point - line_start))
-        numerator = abs(float(np.cross(line_end - line_start, line_start - point)))
-        denominator = float(np.linalg.norm(line_end - line_start))
-        if denominator == 0.0:
-            return 0.0
-        return numerator / denominator
+    def _perp(pt: FloatArray, a: FloatArray, b: FloatArray) -> float:
+        if np.allclose(a, b):
+            return float(np.linalg.norm(pt - a))
+        ba = b - a
+        ap = a - pt
+        num = abs(float(ba[0] * ap[1] - ba[1] * ap[0]))
+        den = float(np.linalg.norm(ba))
+        return num / den if den > 0 else 0.0
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Background worker
+# ===========================================================================
+
+class FitWorker(QObject):
+    finished: Signal = Signal(list, object)
+    error: Signal = Signal(str)
+
+    def __init__(
+        self,
+        x: FloatArray,
+        y: FloatArray,
+        accuracy: float,
+        service: ModelSelectionService,
+    ) -> None:
+        super().__init__()
+        self._x = x.copy()
+        self._y = y.copy()
+        self._accuracy = accuracy
+        self._service = service
+
+    def run(self) -> None:
+        try:
+            models = self._service.fit_all_models(self._x, self._y, self._accuracy)
+            if not any(m is not None for m in models):
+                self.error.emit("Could not fit any model to the data.")
+                return
+            best = self._service.select_best_model(models, self._y)
+            self.finished.emit(models, best)
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(str(exc))
+
+
+# ===========================================================================
 # Settings dialog
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 class SettingsDialog(QDialog):
-    def __init__(self, current_settings: PlotSettings, parent: Optional[QWidget] = None) -> None:
+
+    def __init__(self, settings: PlotSettings, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Plot Settings")
-        self._settings = current_settings
+        self._settings = settings
         self._build_ui()
 
     def _build_ui(self) -> None:
-        layout = QGridLayout()
+        layout = QGridLayout(self)
 
         self._x_min_edit = QLineEdit(str(self._settings.x_min))
         self._x_max_edit = QLineEdit(str(self._settings.x_max))
@@ -777,35 +1744,57 @@ class SettingsDialog(QDialog):
         self._y_max_edit = QLineEdit(str(self._settings.y_max))
         self._grid_edit = QLineEdit(str(self._settings.grid_spacing))
 
-        self._accuracy_spinbox = QDoubleSpinBox()
-        self._accuracy_spinbox.setRange(0.0001, 1.0)
-        self._accuracy_spinbox.setSingleStep(0.0001)
-        self._accuracy_spinbox.setDecimals(4)
-        self._accuracy_spinbox.setValue(self._settings.accuracy)
+        self._accuracy_sb = QDoubleSpinBox()
+        self._accuracy_sb.setRange(0.0001, 1.0)
+        self._accuracy_sb.setSingleStep(0.0001)
+        self._accuracy_sb.setDecimals(4)
+        self._accuracy_sb.setValue(self._settings.accuracy)
 
-        layout.addWidget(QLabel("X Min:"), 0, 0)
-        layout.addWidget(self._x_min_edit, 0, 1)
-        layout.addWidget(QLabel("X Max:"), 1, 0)
-        layout.addWidget(self._x_max_edit, 1, 1)
-        layout.addWidget(QLabel("Y Min:"), 2, 0)
-        layout.addWidget(self._y_min_edit, 2, 1)
-        layout.addWidget(QLabel("Y Max:"), 3, 0)
-        layout.addWidget(self._y_max_edit, 3, 1)
-        layout.addWidget(QLabel("Grid Spacing:"), 4, 0)
-        layout.addWidget(self._grid_edit, 4, 1)
-        layout.addWidget(QLabel("Approximation Accuracy:"), 5, 0)
-        layout.addWidget(self._accuracy_spinbox, 5, 1)
+        # ── LaTeX format controls ──────────────────────────────────────
+        self._latex_approx_cb = QCheckBox("Approximate coefficients (decimals)")
+        self._latex_approx_cb.setChecked(self._settings.latex_approx)
+        self._latex_approx_cb.setToolTip(
+            "ON  — coefficients shown as rounded decimals, e.g. 3.142\n"
+            "OFF — exact rational fractions, e.g. 355/113"
+        )
 
-        button_layout = QHBoxLayout()
-        ok_button = QPushButton("OK")
-        cancel_button = QPushButton("Cancel")
-        ok_button.clicked.connect(self.accept)
-        cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(ok_button)
-        button_layout.addWidget(cancel_button)
+        self._latex_decimals_sb = QSpinBox()
+        self._latex_decimals_sb.setRange(0, 10)
+        self._latex_decimals_sb.setValue(self._settings.latex_decimals)
+        self._latex_decimals_sb.setToolTip("Digits after decimal point in approximate mode")
+        self._latex_approx_cb.toggled.connect(self._latex_decimals_sb.setEnabled)
+        self._latex_decimals_sb.setEnabled(self._settings.latex_approx)
 
-        layout.addLayout(button_layout, 6, 0, 1, 2)
-        self.setLayout(layout)
+        fields: list[tuple[str, QWidget]] = [
+            ("X Min:", self._x_min_edit),
+            ("X Max:", self._x_max_edit),
+            ("Y Min:", self._y_min_edit),
+            ("Y Max:", self._y_max_edit),
+            ("Grid Spacing:", self._grid_edit),
+            ("Approximation Accuracy:", self._accuracy_sb),
+        ]
+        for row, (label, widget) in enumerate(fields):
+            layout.addWidget(QLabel(label), row, 0)
+            layout.addWidget(widget, row, 1)
+
+        # LaTeX section with a visual separator
+        sep_row = len(fields)
+        sep = QLabel("─── LaTeX Output Format ───")
+        sep.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(sep, sep_row, 0, 1, 2)
+
+        layout.addWidget(self._latex_approx_cb, sep_row + 1, 0, 1, 2)
+        layout.addWidget(QLabel("Digits after decimal point:"), sep_row + 2, 0)
+        layout.addWidget(self._latex_decimals_sb, sep_row + 2, 1)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row, sep_row + 3, 0, 1, 2)
 
     def get_settings(self) -> Optional[PlotSettings]:
         try:
@@ -815,46 +1804,73 @@ class SettingsDialog(QDialog):
                 y_min=float(self._y_min_edit.text()),
                 y_max=float(self._y_max_edit.text()),
                 grid_spacing=float(self._grid_edit.text()),
-                accuracy=float(self._accuracy_spinbox.value()),
+                accuracy=float(self._accuracy_sb.value()),
+                latex_approx=bool(self._latex_approx_cb.isChecked()),
+                latex_decimals=int(self._latex_decimals_sb.value()),
             )
         except (ValueError, TypeError):
             return None
 
 
-# ---------------------------------------------------------------------------
-# Main application window
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Main window
+# ===========================================================================
 
 class DrawingApp(QMainWindow):
-    _COLORS: tuple[tuple[int, int, int], ...] = (
-        (255, 0, 0),
-        (0, 200, 0),
-        (255, 150, 0),
-        (200, 0, 200),
-        (0, 200, 200),
+
+    # One pleasant, distinct colour per canonical model slot (12 total).
+    # Order matches ModelSelectionService.CANONICAL_NAMES exactly.
+    _MODEL_COLORS: tuple[tuple[int, int, int], ...] = (
+        (220, 80, 80),      # 1  Cubic Spline           — warm red
+        (60, 160, 240),     # 2  Interpolation poly     — sky blue
+        (255, 140, 0),      # 3  L-inf minimax          — amber
+        (80, 200, 80),      # 4  LS Chebyshev           — grass green
+        (180, 80, 220),     # 5  NUFFT                  — violet
+        (20, 210, 190),     # 6  AAA                    — teal
+        (240, 100, 160),    # 7  Exponential            — rose
+        (160, 220, 60),     # 8  Logarithmic            — lime
+        (240, 190, 40),     # 9  Rational               — gold
+        (90, 190, 255),     # 10 Sinusoidal             — azure
+        (255, 130, 60),     # 11 Tangential             — coral
+        (140, 100, 240),    # 12 Arctan (S-curve)       — lavender
     )
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Function Drawer and LaTeX Generator")
-        self.setGeometry(100, 100, 1400, 800)
+        self.setWindowTitle("Function Drawer — High-Precision LaTeX Engine")
+        self.setGeometry(100, 100, 1450, 820)
 
         self._model_service = ModelSelectionService()
-        self._latex = LaTeXGenerator()
-
         self._settings = PlotSettings()
+        self._latex_gen = LaTeXGenerator(
+            approx=self._settings.latex_approx,
+            decimals=self._settings.latex_decimals,
+        )
+
         self._drawing = False
         self._strokes: list[list[tuple[float, float]]] = []
         self._current_stroke: Optional[list[tuple[float, float]]] = None
+
         self._panning = False
-        self._pan_start_pos: Optional[QPointF] = None
+        self._pan_start_scene_pos: Optional[QPointF] = None  # Store scene (pixel) position
         self._pan_start_range: Optional[tuple[tuple[float, float], tuple[float, float]]] = None
 
-        self._fitted_curves: list[Any] = []
         self._drawn_curve: Optional[Any] = None
-        self._shown_models: list[FittedModel] = []
+        # One slot per canonical model (None = not yet fitted / did not converge)
+        self._fitted_curves: list[Optional[Any]] = [None] * len(
+            ModelSelectionService.CANONICAL_NAMES
+        )
+        self._shown_models: list[Optional[FittedModel]] = [None] * len(
+            ModelSelectionService.CANONICAL_NAMES
+        )
+        self._model_latex_rows: list[str] = []
         self._option_checkboxes: list[QCheckBox] = []
         self._option_widgets: list[QWidget] = []
+
+        self._thread: Optional[QThread] = None
+        self._worker: Optional[FitWorker] = None
+        self._x_proc: FloatArray = np.empty(0, dtype=np.float64)
+        self._y_proc: FloatArray = np.empty(0, dtype=np.float64)
 
         self._build_ui()
         self._configure_plot()
@@ -862,147 +1878,235 @@ class DrawingApp(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
+        root = QHBoxLayout(central)
 
-        left_layout = QVBoxLayout()
+        left = QVBoxLayout()
         self._plot_widget = pg.PlotWidget()
         self._plot_widget.addLegend(offset=(10, 10))
-        left_layout.addWidget(self._plot_widget)
+        left.addWidget(self._plot_widget)
 
-        button_layout = QHBoxLayout()
-        self._clear_button = QPushButton("Clear")
-        self._fit_button = QPushButton("Fit Curve")
-        self._export_button = QPushButton("Copy LaTeX")
-        self._settings_button = QPushButton("Settings")
+        btn_row = QHBoxLayout()
+        self._clear_btn = QPushButton("Clear")
+        self._fit_btn = QPushButton("Fit Curve")
+        self._export_btn = QPushButton("Copy LaTeX")
+        self._settings_btn = QPushButton("Settings")
+        self._status_lbl = QLabel("Ready")
+        self._status_lbl.setStyleSheet("color: gray; font-style: italic;")
 
-        self._clear_button.clicked.connect(self.clear_drawing)
-        self._fit_button.clicked.connect(self.fit_curve)
-        self._export_button.clicked.connect(self.copy_latex)
-        self._settings_button.clicked.connect(self.show_settings)
+        self._clear_btn.clicked.connect(self.clear_drawing)
+        self._fit_btn.clicked.connect(self.fit_curve)
+        self._export_btn.clicked.connect(self.copy_latex)
+        self._settings_btn.clicked.connect(self.show_settings)
 
-        button_layout.addWidget(self._clear_button)
-        button_layout.addWidget(self._fit_button)
-        button_layout.addWidget(self._export_button)
-        button_layout.addWidget(self._settings_button)
-        left_layout.addLayout(button_layout)
+        for widget in (self._clear_btn, self._fit_btn, self._export_btn,
+                       self._settings_btn, self._status_lbl):
+            btn_row.addWidget(widget)
+        left.addLayout(btn_row)
+        root.addLayout(left, 3)
 
-        main_layout.addLayout(left_layout, 3)
+        right = QVBoxLayout()
 
-        right_layout = QVBoxLayout()
-
-        options_group = QGroupBox("Display Options")
-        self._options_layout = QVBoxLayout()
-        options_group.setLayout(self._options_layout)
-
-        self._clear_on_new_line = QCheckBox("Clear plot on a new line")
+        # ── top control ────────────────────────────────────────────────
+        self._clear_on_new_line = QCheckBox("Clear plot on new stroke")
         self._clear_on_new_line.setChecked(True)
-        self._options_layout.addWidget(self._clear_on_new_line)
+        right.addWidget(self._clear_on_new_line)
 
-        right_layout.addWidget(options_group)
-        right_layout.addWidget(QLabel("LaTeX Output (Top Candidates):"))
+        # ── fixed 12-model panel ───────────────────────────────────────
+        opts_group = QGroupBox("Models")
+        self._options_layout = QVBoxLayout()
+        self._options_layout.setSpacing(2)
+        opts_group.setLayout(self._options_layout)
+        right.addWidget(opts_group)
 
+        # Pre-create one row per canonical model slot — always visible
+        for idx, name in enumerate(ModelSelectionService.CANONICAL_NAMES):
+            color = self._MODEL_COLORS[idx]
+            row, cb = self._create_option_row(idx, name, "", color, False,
+                                              enabled=False)
+            self._options_layout.addWidget(row)
+            self._option_widgets.append(row)
+            self._option_checkboxes.append(cb)
+
+        # ── LaTeX output panel ─────────────────────────────────────────
+        right.addWidget(QLabel("LaTeX Output (checked models):"))
         self._latex_output = QTextEdit()
         self._latex_output.setReadOnly(True)
-        right_layout.addWidget(self._latex_output)
-
-        main_layout.addLayout(right_layout, 1)
+        self._latex_output.setFontFamily("Courier New")
+        right.addWidget(self._latex_output)
+        root.addLayout(right, 1)
 
         vb = self._plot_widget.plotItem.vb
         vb.setMenuEnabled(False)
-        vb.setMouseEnabled(x=True, y=True)
+        # Disable pyqtgraph's built-in mouse modes to prevent interference
+        vb.setMouseMode(vb.RectMode)  # Set to rect mode but we'll override with event filter
+        vb.setMouseEnabled(x=False, y=False)  # Disable built-in mouse panning
         self._plot_widget.viewport().installEventFilter(self)
 
     def _configure_plot(self) -> None:
         self._plot_widget.setLabel("left", "y")
         self._plot_widget.setLabel("bottom", "x")
         self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
-
         vb = self._plot_widget.plotItem.vb
         vb.disableAutoRange()
         self._plot_widget.setXRange(self._settings.x_min, self._settings.x_max)
         self._plot_widget.setYRange(self._settings.y_min, self._settings.y_max)
 
-    # ------------------------------------------------------------------
-    # Event filter
-    # ------------------------------------------------------------------
-
     def eventFilter(self, obj: Any, event: QEvent) -> bool:  # noqa: N802
         if obj is not self._plot_widget.viewport():
             return super().eventFilter(obj, event)
+
+        vb = self._plot_widget.plotItem.vb
+        et = event.type()
+
+        # Handle wheel events for zooming
+        if et == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
+            # Get the mouse position in view coordinates
+            mouse_point = vb.mapSceneToView(event.position())
+            mouse_x = float(mouse_point.x())
+            mouse_y = float(mouse_point.y())
+
+            # Get current view range
+            xr, yr = vb.viewRange()
+            x_min, x_max = float(xr[0]), float(xr[1])
+            y_min, y_max = float(yr[0]), float(yr[1])
+
+            # Calculate zoom factor based on wheel delta
+            # Positive delta = zoom in, negative = zoom out
+            angle_delta = event.angleDelta().y()
+            zoom_factor = 1.0 - (angle_delta / 1200.0)  # ~0.9 for zoom in, ~1.1 for zoom out
+            zoom_factor = max(0.5, min(2.0, zoom_factor))  # Clamp to reasonable range
+
+            # Calculate new ranges centered on mouse position
+            x_span = (x_max - x_min) * zoom_factor
+            y_span = (y_max - y_min) * zoom_factor
+
+            # Calculate how far the mouse is from the left/bottom edges (as fraction)
+            x_frac = (mouse_x - x_min) / (x_max - x_min) if x_max != x_min else 0.5
+            y_frac = (mouse_y - y_min) / (y_max - y_min) if y_max != y_min else 0.5
+
+            # New ranges keep the mouse position at the same location
+            new_x_min = mouse_x - x_span * x_frac
+            new_x_max = mouse_x + x_span * (1.0 - x_frac)
+            new_y_min = mouse_y - y_span * y_frac
+            new_y_max = mouse_y + y_span * (1.0 - y_frac)
+
+            # Apply the new range
+            vb.setRange(
+                xRange=(new_x_min, new_x_max),
+                yRange=(new_y_min, new_y_max),
+                padding=0,
+                update=True
+            )
+            return True
+
+        # Handle mouse events
         if not isinstance(event, QMouseEvent):
             return super().eventFilter(obj, event)
 
-        vb = self._plot_widget.plotItem.vb
-
-        if event.type() == QEvent.Type.MouseButtonPress:
+        if et == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.LeftButton:
                 if self._clear_on_new_line.isChecked():
                     self.clear_drawing()
-                # Use position() (QPointF) instead of the deprecated pos() (QPoint)
-                view_pos = vb.mapSceneToView(event.position())
+                vp = vb.mapSceneToView(event.position())
                 self._drawing = True
-                self._current_stroke = [(float(view_pos.x()), float(view_pos.y()))]
+                self._current_stroke = [(float(vp.x()), float(vp.y()))]
                 self._strokes.append(self._current_stroke)
                 return True
-
             if event.button() == Qt.MouseButton.RightButton:
                 self._panning = True
-                self._pan_start_pos = vb.mapSceneToView(event.position())
-                x_range: list[float] = vb.viewRange()[0]
-                y_range: list[float] = vb.viewRange()[1]
+                # Store scene position (widget pixel coordinates - these don't change)
+                self._pan_start_scene_pos = QPointF(event.position())
+                # Store the current view range
+                xr, yr = vb.viewRange()
                 self._pan_start_range = (
-                    (float(x_range[0]), float(x_range[1])),
-                    (float(y_range[0]), float(y_range[1])),
+                    (float(xr[0]), float(xr[1])),
+                    (float(yr[0]), float(yr[1])),
                 )
-                self._plot_widget.viewport().setCursor(
-                    QCursor(Qt.CursorShape.ClosedHandCursor)
-                )
+                self._plot_widget.viewport().setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
                 return True
 
-        if event.type() == QEvent.Type.MouseMove:
+        if et == QEvent.Type.MouseMove:
             if self._drawing and self._current_stroke is not None:
-                view_pos = vb.mapSceneToView(event.position())
-                self._current_stroke.append(
-                    (float(view_pos.x()), float(view_pos.y()))
-                )
+                vp = vb.mapSceneToView(event.position())
+                self._current_stroke.append((float(vp.x()), float(vp.y())))
                 self.update_drawing()
                 return True
+            if (self._panning
+                    and self._pan_start_scene_pos is not None
+                    and self._pan_start_range is not None):
+                # Calculate delta in scene (pixel) coordinates
+                current_scene_pos = event.position()
+                dx_scene = current_scene_pos.x() - self._pan_start_scene_pos.x()
+                dy_scene = current_scene_pos.y() - self._pan_start_scene_pos.y()
 
-            if (
-                self._panning
-                and self._pan_start_pos is not None
-                and self._pan_start_range is not None
-            ):
-                current_pos = vb.mapSceneToView(event.position())
-                dx = float(self._pan_start_pos.x() - current_pos.x())
-                dy = float(self._pan_start_pos.y() - current_pos.y())
+                # Convert scene delta to view delta using the ORIGINAL view range
+                # This avoids the feedback loop from coordinate transformation
+                (x0, x1), (y0, y1) = self._pan_start_range
+                view_width = x1 - x0
+                view_height = y1 - y0
 
-                x_range_start, y_range_start = self._pan_start_range
-                vb.setRange(
-                    xRange=(x_range_start[0] + dx, x_range_start[1] + dx),
-                    yRange=(y_range_start[0] + dy, y_range_start[1] + dy),
-                    padding=0,
-                )
+                # Get the viewport size in pixels
+                vb_rect = vb.boundingRect()
+                pixel_width = vb_rect.width()
+                pixel_height = vb_rect.height()
+
+                # Calculate view deltas (inverted for natural panning direction)
+                if pixel_width > 0 and pixel_height > 0:
+                    dx_view = -dx_scene * view_width / pixel_width
+                    dy_view = dy_scene * view_height / pixel_height
+
+                    # Apply the offset to the original range
+                    new_x_range = (x0 + dx_view, x1 + dx_view)
+                    new_y_range = (y0 + dy_view, y1 + dy_view)
+
+                    # Update the view range without triggering autoRange
+                    vb.setRange(xRange=new_x_range, yRange=new_y_range, padding=0, update=True)
                 return True
 
-        if event.type() == QEvent.Type.MouseButtonRelease:
+        if et == QEvent.Type.MouseButtonRelease:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._drawing = False
                 self._current_stroke = None
                 return True
-
             if event.button() == Qt.MouseButton.RightButton:
                 self._panning = False
-                self._pan_start_pos = None
+                self._pan_start_scene_pos = None
                 self._pan_start_range = None
                 self._plot_widget.viewport().unsetCursor()
                 return True
 
         return super().eventFilter(obj, event)
 
-    # ------------------------------------------------------------------
-    # Drawing helpers
-    # ------------------------------------------------------------------
+    def _clear_results(self) -> None:
+        """Remove fitted plot curves and reset all 12 model rows to disabled state."""
+        # Remove plot curves
+        for c in self._fitted_curves:
+            if c is not None:
+                try:
+                    self._plot_widget.removeItem(c)
+                except (RuntimeError, ValueError, AttributeError):
+                    # Item may have already been removed or become invalid
+                    pass
+        n_slots = len(ModelSelectionService.CANONICAL_NAMES)
+        self._fitted_curves = [None] * n_slots
+        self._shown_models = [None] * n_slots
+        self._model_latex_rows = [""] * n_slots
+
+        # Reset every row to disabled/unchecked appearance
+        for idx, cb in enumerate(self._option_checkboxes):
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.setEnabled(False)
+            cb.blockSignals(False)
+            # Dim the label
+            if idx < len(self._option_widgets):
+                lbl = self._option_widgets[idx].findChild(QLabel)
+                if lbl is not None:
+                    r, g, b = self._MODEL_COLORS[idx]
+                    lbl.setStyleSheet(
+                        f"color: rgba({r},{g},{b},90); font-weight: normal;"
+                    )
+                    lbl.setText(f"{idx + 1}. {ModelSelectionService.CANONICAL_NAMES[idx]}")
 
     def clear_drawing(self) -> None:
         self._strokes.clear()
@@ -1011,30 +2115,20 @@ class DrawingApp(QMainWindow):
         self._panning = False
         self._pan_start_pos = None
         self._pan_start_range = None
-
         self._plot_widget.viewport().unsetCursor()
 
         if self._drawn_curve is not None:
             self._plot_widget.removeItem(self._drawn_curve)
             self._drawn_curve = None
 
-        for curve in self._fitted_curves:
-            self._plot_widget.removeItem(curve)
-        self._fitted_curves.clear()
-
-        for widget in self._option_widgets:
-            widget.setParent(None)  # type: ignore[call-overload]
-            widget.deleteLater()
-        self._option_widgets.clear()
-        self._option_checkboxes.clear()
-
+        self._clear_results()
         self._latex_output.clear()
-        self._shown_models.clear()
+        self._status_lbl.setText("Ready")
+        self._status_lbl.setStyleSheet("color: gray; font-style: italic;")
 
     def update_drawing(self) -> None:
         xs: list[float] = []
         ys: list[float] = []
-
         for stroke in self._strokes:
             if not stroke:
                 continue
@@ -1051,189 +2145,293 @@ class DrawingApp(QMainWindow):
                 self._drawn_curve = None
             return
 
-        x_arr = np.asarray(xs, dtype=np.float64)
-        y_arr = np.asarray(ys, dtype=np.float64)
-
+        xa = np.asarray(xs, dtype=np.float64)
+        ya = np.asarray(ys, dtype=np.float64)
         if self._drawn_curve is None:
             self._drawn_curve = self._plot_widget.plot(
-                x_arr,
-                y_arr,
-                pen=pg.mkPen((100, 100, 255), width=2),
-                name="Drawn curve",
+                xa, ya, pen=pg.mkPen((100, 120, 255), width=2), name="Drawn curve"
             )
         else:
-            self._drawn_curve.setData(x_arr, y_arr)
-
-    # ------------------------------------------------------------------
-    # Curve fitting
-    # ------------------------------------------------------------------
+            self._drawn_curve.setData(xa, ya)
 
     def fit_curve(self) -> None:
-        points: list[tuple[float, float]] = []
-        for stroke in self._strokes:
-            points.extend(stroke)
-
+        points: list[tuple[float, float]] = [p for stroke in self._strokes for p in stroke]
         if len(points) < 10:
-            QMessageBox.warning(
-                self, "Insufficient Data", "Draw a longer curve (at least 10 points)."
-            )
+            QMessageBox.warning(self, "Insufficient Data",
+                                "Draw a longer curve (at least 10 points).")
             return
 
-        points_array = np.asarray(points, dtype=np.float64)
-        x_raw: FloatArray = points_array[:, 0]
-        y_raw: FloatArray = points_array[:, 1]
+        pts = np.asarray(points, dtype=np.float64)
+        x_raw: FloatArray = pts[:, 0]
+        y_raw: FloatArray = pts[:, 1]
 
         try:
-            preprocessor = StrokePreprocessor(
-                self._settings.domain_width, self._settings.domain_height
-            )
-            x_proc, y_proc = preprocessor.preprocess(x_raw, y_raw)
-
-            if len(x_proc) < 5:
-                QMessageBox.warning(
-                    self, "Processing Error", "Not enough points after preprocessing."
-                )
+            pre = StrokePreprocessor(self._settings.domain_width, self._settings.domain_height)
+            x_p, y_p = pre.preprocess(x_raw, y_raw)
+            if len(x_p) < 5:
+                QMessageBox.warning(self, "Processing Error",
+                                    "Not enough points after preprocessing.")
                 return
-
-            is_func, error_msg = preprocessor.is_function(x_proc, y_proc)
-            if not is_func:
-                QMessageBox.warning(self, "Not a Function", error_msg)
+            ok, msg = pre.is_function(x_p, y_p)
+            if not ok:
+                QMessageBox.warning(self, "Not a Function", msg)
                 return
         except (ValueError, TypeError, IndexError) as exc:
-            QMessageBox.critical(self, "Error", f"Preprocessing failed: {exc}")
+            QMessageBox.critical(self, "Preprocessing Error", str(exc))
             return
 
-        try:
-            models = self._model_service.fit_all_models(
-                x_proc, y_proc, self._settings.accuracy
-            )
-            if not models:
-                QMessageBox.warning(
-                    self, "Fitting Failed", "Could not fit any model to the data."
-                )
-                return
-            best_model = self._model_service.select_best_model(models, y_proc)
-        except (ValueError, RuntimeError, TypeError) as exc:
-            QMessageBox.critical(self, "Error", f"Model fitting failed: {exc}")
-            return
+        self._x_proc = x_p
+        self._y_proc = y_p
+        self._fit_btn.setEnabled(False)
+        self._status_lbl.setText("Fitting... please wait")
+        self._status_lbl.setStyleSheet("color: orange; font-style: italic;")
 
-        self._display_fitted_models(models, best_model, x_proc, y_proc)
+        self._thread = QThread()
+        self._worker = FitWorker(x_p, y_p, self._settings.accuracy, self._model_service)
+        self._worker.moveToThread(self._thread)
+
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_fit_finished)
+        self._worker.error.connect(self._on_fit_error)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.error.connect(self._thread.quit)
+        self._thread.finished.connect(self._on_thread_done)
+        self._thread.start()
+
+    def _on_fit_finished(
+        self, models: list[Optional[FittedModel]], best_model: Optional[FittedModel]
+    ) -> None:
+        self._display_fitted_models(models, best_model, self._x_proc, self._y_proc)
+
+    def _on_fit_error(self, msg: str) -> None:
+        QMessageBox.critical(self, "Fitting Error", msg)
+
+    def _on_thread_done(self) -> None:
+        self._fit_btn.setEnabled(True)
+        self._status_lbl.setText("Done")
+        self._status_lbl.setStyleSheet("color: green; font-style: italic;")
+
+    @staticmethod
+    def _build_latex_row(
+        idx: int, model: FittedModel, y_scale: float,
+        latex_str: str, is_best: bool,
+    ) -> str:
+        """Format one model's text block for the LaTeX output pane."""
+        marker = " ★ BEST" if is_best else ""
+        return (
+            f"─── {idx + 1}. {model.name}{marker}\n"
+            f"    RMSE  : {model.rmse:.6f}\n"
+            f"    L-inf : {model.l_inf:.6f}\n"
+            f"    BIC   : {model.bic:.4f}\n"
+            f"    Score : {model.score(y_scale):.6f}\n"
+            f"    LaTeX : {latex_str}\n"
+        )
 
     def _display_fitted_models(
         self,
-        models: list[FittedModel],
-        best_model: FittedModel,
+        models: list[Optional[FittedModel]],
+        best_model: Optional[FittedModel],
         x_proc: FloatArray,
         y_proc: FloatArray,
     ) -> None:
-        y_std = float(np.std(y_proc))
-        scores = np.asarray(
-            [
-                (m.rmse / y_std if y_std > 0 else m.rmse) + 0.1 * m.aic + m.complexity
-                for m in models
-            ],
-            dtype=np.float64,
+        """Update the 12 model rows, sorted by score (best first), with no extra markings."""
+        y_scale = float(np.std(y_proc)) or 1.0
+        self._clear_results()
+
+        x_plot = np.linspace(
+            float(np.min(x_proc)), float(np.max(x_proc)), 600, dtype=np.float64
         )
-        sorted_indices = np.argsort(scores)
-        top_models = [models[int(i)] for i in sorted_indices[: min(5, len(models))]]
+        y_clip = float(np.max(np.abs(y_proc))) * 10
 
-        self._shown_models = top_models
+        # Build list of all models with their canonical indices and scores
+        all_models_data: list[tuple[int, Optional[FittedModel], float]] = []
+        for idx, model in enumerate(models):
+            if model is not None:
+                score = model.score(y_scale)
+                all_models_data.append((idx, model, score))
+            else:
+                # Non-converged models go to the end with infinite score
+                all_models_data.append((idx, None, float('inf')))
 
-        for curve in self._fitted_curves:
-            self._plot_widget.removeItem(curve)
-        self._fitted_curves.clear()
+        # Sort by score (lower is better)
+        all_models_data.sort(key=lambda x: x[2])
 
-        for widget in self._option_widgets:
-            widget.setParent(None)  # type: ignore[call-overload]
-            widget.deleteLater()
-        self._option_widgets.clear()
-        self._option_checkboxes.clear()
+        # Determine which models to auto-check (top N converged ones)
+        converged_count = sum(1 for _, m, _ in all_models_data if m is not None)
+        top_checked_count = min(N_TOP_CHECKED, converged_count)
 
-        latex_parts: list[str] = []
-        x_plot = np.linspace(float(np.min(x_proc)), float(np.max(x_proc)), 500, dtype=np.float64)
+        # Update each UI row based on sorted order
+        for display_idx, (canonical_idx, model, score) in enumerate(all_models_data):
+            self._shown_models[display_idx] = model
 
-        for idx, model in enumerate(top_models):
-            latex_str = self._latex.generate(model)
-            marker = "★ BEST FIT" if model is best_model else ""
-            latex_parts.append(
-                f"Option {idx + 1} - {model.name} {marker}\nRMSE: {model.rmse:.6f}\n{latex_str}\n"
-            )
+            cb = self._option_checkboxes[display_idx]
+            lbl = self._option_widgets[display_idx].findChild(QLabel)
+            r, g, b = self._MODEL_COLORS[canonical_idx]  # Use canonical color
+            canonical_name = ModelSelectionService.CANONICAL_NAMES[canonical_idx]
 
-            try:
-                y_plot = np.asarray(model.evaluate(x_plot), dtype=np.float64)
-                color = self._COLORS[idx % len(self._COLORS)]
-                style = (
-                    Qt.PenStyle.SolidLine if model is best_model else Qt.PenStyle.DashLine
-                )
-                width = 3 if model is best_model else 2
-
-                curve = self._plot_widget.plot(
-                    x_plot,
-                    y_plot,
-                    pen=pg.mkPen(color, width=width, style=style),
-                    name=f"Option {idx + 1}: {model.name}",
-                )
-                self._fitted_curves.append(curve)
-            except (ValueError, RuntimeError, OverflowError, FloatingPointError):
+            if model is None:
+                # Model did not converge — show disabled at bottom of list
+                cb.blockSignals(True)
+                cb.setChecked(False)
+                cb.setEnabled(False)
+                cb.blockSignals(False)
+                if lbl is not None:
+                    lbl.setStyleSheet(
+                        f"color: rgba({r},{g},{b},90); font-weight: normal;"
+                    )
+                    lbl.setText(f"{display_idx + 1}. {canonical_name}  (—)")
+                self._fitted_curves[display_idx] = None
+                self._model_latex_rows[display_idx] = ""
                 continue
 
-            row, checkbox = self._create_option_row(idx, model.name, marker, color)
-            self._options_layout.addWidget(row)
-            self._option_widgets.append(row)
-            self._option_checkboxes.append(checkbox)
+            # Model converged — check if it's in top N
+            is_in_top = display_idx < top_checked_count
+            is_best = model is best_model
 
-        self._latex_output.setPlainText("\n".join(latex_parts))
+            latex_str = self._latex_gen.generate(model)
+            self._model_latex_rows[display_idx] = self._build_latex_row(
+                display_idx, model, y_scale, latex_str, is_best
+            )
+
+            # Update label with NO extra markings
+            if lbl is not None:
+                lbl.setStyleSheet(
+                    f"color: rgb({r},{g},{b}); "
+                    f"font-weight: {'bold' if is_best else 'normal'};"
+                )
+                lbl.setText(f"{display_idx + 1}. {canonical_name}")
+
+            cb.blockSignals(True)
+            cb.setChecked(is_in_top)
+            cb.setEnabled(True)
+            cb.blockSignals(False)
+
+            # Plot curve
+            try:
+                y_plot = np.clip(
+                    np.asarray(model.evaluate(x_plot), dtype=np.float64),
+                    -y_clip, y_clip,
+                )
+                style = Qt.PenStyle.SolidLine if is_best else Qt.PenStyle.DashLine
+                width = 3 if is_best else 2
+                curve = self._plot_widget.plot(
+                    x_plot, y_plot,
+                    pen=pg.mkPen((r, g, b), width=width, style=style),
+                    name=f"{display_idx + 1}. {canonical_name}",
+                )
+                self._fitted_curves[display_idx] = curve
+                curve.setVisible(is_in_top)
+            except (ValueError, TypeError, RuntimeError, OverflowError,
+                    np.linalg.LinAlgError, FloatingPointError):
+                self._fitted_curves[display_idx] = None
+
+        self._refresh_latex_output()
+
+    def _refresh_latex_output(self) -> None:
+        """Rebuild the LaTeX pane: show only rows whose checkbox is checked."""
+        parts: list[str] = []
+        for idx, row_text in enumerate(self._model_latex_rows):
+            cb = (self._option_checkboxes[idx]
+                  if idx < len(self._option_checkboxes) else None)
+            if cb is not None and cb.isChecked() and row_text:
+                parts.append(row_text)
+        self._latex_output.setPlainText(
+            "\n".join(parts) if parts else "(no model selected)"
+        )
 
     def _create_option_row(
-        self, idx: int, model_name: str, marker: str, color: tuple[int, int, int]
+        self,
+        idx: int,
+        model_name: str,
+        marker: str,
+        color: tuple[int, int, int],
+        checked: bool,
+        enabled: bool = True,
     ) -> tuple[QWidget, QCheckBox]:
         row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(8)
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(2, 1, 2, 1)
+        hl.setSpacing(6)
 
-        checkbox = QCheckBox()
-        checkbox.setChecked(True)
-        checkbox.toggled.connect(lambda checked, i=idx: self.toggle_option(i, checked))
+        cb = QCheckBox()
+        cb.setChecked(checked)
+        cb.setEnabled(enabled)
+        cb.toggled.connect(lambda state, i=idx: self.toggle_option(i, state))
 
         r, g, b = color
-        label = QLabel(f"Option {idx + 1}: {model_name} {marker}")
-        label.setStyleSheet(f"color: rgb({r}, {g}, {b}); font-weight: bold;")
+        if enabled:
+            style = f"color: rgb({r},{g},{b}); font-weight: bold;"
+        else:
+            style = f"color: rgba({r},{g},{b},90); font-weight: normal;"
+        label_text = f"{idx + 1}. {model_name}" + (f" {marker}" if marker else "")
+        lbl = QLabel(label_text)
+        lbl.setStyleSheet(style)
 
-        row_layout.addWidget(checkbox)
-        row_layout.addWidget(label)
-        row_layout.addStretch(1)
-
-        return row, checkbox
+        hl.addWidget(cb)
+        hl.addWidget(lbl)
+        hl.addStretch(1)
+        return row, cb
 
     def toggle_option(self, index: int, checked: bool) -> None:
         if 0 <= index < len(self._fitted_curves):
-            self._fitted_curves[index].setVisible(bool(checked))
+            curve = self._fitted_curves[index]
+            if curve is not None:
+                curve.setVisible(checked)
+        self._refresh_latex_output()
 
     def copy_latex(self) -> None:
-        latex_text = self._latex_output.toPlainText()
-        if latex_text:
-            QApplication.clipboard().setText(latex_text)
+        text = self._latex_output.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
             QMessageBox.information(self, "Copied", "LaTeX copied to clipboard.")
 
     def show_settings(self) -> None:
-        dialog = SettingsDialog(self._settings, self)
-        if dialog.exec():
-            new_settings = dialog.get_settings()
-            if new_settings is None:
-                QMessageBox.critical(self, "Invalid Settings", "Settings values are invalid.")
+        dlg = SettingsDialog(self._settings, self)
+        if dlg.exec():
+            new_s = dlg.get_settings()
+            if new_s is None:
+                QMessageBox.critical(self, "Invalid Settings",
+                                     "One or more values are invalid.")
                 return
             try:
-                self._settings = new_settings
+                latex_format_changed = (
+                    new_s.latex_approx != self._settings.latex_approx
+                    or new_s.latex_decimals != self._settings.latex_decimals
+                )
+                self._settings = new_s
+                self._latex_gen.reconfigure(new_s.latex_approx, new_s.latex_decimals)
+
+                if latex_format_changed and any(
+                    m is not None for m in self._shown_models
+                ):
+                    y_scale = (float(np.std(self._y_proc)) or 1.0
+                               if len(self._y_proc) > 0 else 1.0)
+                    for idx, model in enumerate(self._shown_models):
+                        if model is None:
+                            self._model_latex_rows[idx] = ""
+                            continue
+                        is_best = (
+                            idx == next(
+                                (i for i, m in enumerate(self._shown_models)
+                                 if m is not None), -1
+                            )
+                        )
+                        latex_str = self._latex_gen.generate(model)
+                        self._model_latex_rows[idx] = self._build_latex_row(
+                            idx, model, y_scale, latex_str, is_best
+                        )
+                    self._refresh_latex_output()
+
                 self._configure_plot()
-                self.clear_drawing()
+                if not latex_format_changed:
+                    self.clear_drawing()
             except ValueError as exc:
                 QMessageBox.critical(self, "Invalid Settings", str(exc))
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Entry point
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def main() -> None:
     app = QApplication(sys.argv)
