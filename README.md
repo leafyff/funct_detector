@@ -46,14 +46,14 @@ The following canonical models are implemented:
 
 Each fitted model is evaluated using:
 
-[  
+$$
 \text{Score} = \alpha \frac{L_\infty}{\sigma} + \beta \frac{\text{RMSE}}{\sigma} + \gamma \cdot \text{complexity}  
-]
+$$
 
 Where:
-- ( L_\infty ) is the maximum absolute error
+- ( $L_\infty$ ) is the maximum absolute error
 - RMSE is the root-mean-square error
-- ( \sigma ) is the standard deviation of the drawn data
+- ( $\sigma$ ) is the standard deviation of the drawn data
 - complexity penalizes overfitting
 
 The system favors models that balance accuracy and simplicity.
