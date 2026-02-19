@@ -1,0 +1,6 @@
+numpy
+scipy
+sympy
+pyqtgraph
+PySide6
+pip>=23

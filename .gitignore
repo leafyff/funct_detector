@@ -1,3 +1,65 @@
 funct_detector/dist/
 funct_detector/build/
 funct_detector/.idea/
+funct_detector/main.spec/
+funct_detector/func_fitter.spec/
+
+# ---- Python bytecode / caches ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+
+# ---- Packaging / build outputs ----
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+wheelhouse/
+*.whl
+
+# ---- Test / coverage / tooling caches ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
+.cache/
+
+# ---- Jupyter / notebooks ----
+.ipynb_checkpoints/
+
+# ---- Logs ----
+*.log
+
+# ---- OS junk ----
+.DS_Store
+Thumbs.db
+
+# ---- Editors / IDEs ----
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---- PyInstaller ----
+*.spec
+*.manifest
+*.app
+*.exe
+
+# ---- Obsidian (optional: keep ignored unless you want vault config in repo) ----
+.obsidian/
